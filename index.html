@@ -476,8 +476,9 @@ async function loadDashboard() {
     const st = (!f || !f.lignes || !f.lignes.length) ? "manquant" : f.statut;
     return { u, statut: st, total: f ? total(f.lignes || []) : 0 };
   });
-  // tendance : total d'heures des 12 dernières semaines
-  const { data: sems } = await sb.from("semaines").select("id, numero, annee, date_debut").order("date_debut", { ascending: false }).limit(12);
+  // tendance : total d'heures des 12 dernières semaines (jusqu'à la semaine en cours, pas les semaines futures)
+  const { data: sems } = await sb.from("semaines").select("id, numero, annee, date_debut")
+    .lte("date_debut", today()).order("date_debut", { ascending: false }).limit(12);
   const ids = (sems || []).map((s) => s.id);
   let byS = {};
   if (ids.length) {
