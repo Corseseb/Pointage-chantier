@@ -476,16 +476,18 @@ async function loadDashboard() {
     const st = (!f || !f.lignes || !f.lignes.length) ? "manquant" : f.statut;
     return { u, statut: st, total: f ? total(f.lignes || []) : 0 };
   });
-  // tendance : total d'heures des 12 dernières semaines (jusqu'à la semaine en cours, pas les semaines futures)
-  const { data: sems } = await sb.from("semaines").select("id, numero, annee, date_debut")
-    .lte("date_debut", today()).order("date_debut", { ascending: false }).limit(12);
-  const ids = (sems || []).map((s) => s.id);
-  let byS = {};
-  if (ids.length) {
+  // tendance : les 12 dernières semaines QUI ONT des pointages (ordre chronologique)
+  const { data: fRows } = await sb.from("feuilles").select("semaine_id");
+  const idsData = [...new Set((fRows || []).map((f) => f.semaine_id))];
+  let sems = [], byS = {};
+  if (idsData.length) {
+    const r = await sb.from("semaines").select("id, numero, annee, date_debut").in("id", idsData).order("date_debut", { ascending: false }).limit(12);
+    sems = r.data || [];
+    const ids = sems.map((s) => s.id);
     const { data: fs } = await sb.from("feuilles").select("semaine_id, lignes(h_lundi,h_mardi,h_mercredi,h_jeudi,h_vendredi)").in("semaine_id", ids);
     (fs || []).forEach((f) => byS[f.semaine_id] = (byS[f.semaine_id] || 0) + total(f.lignes || []));
   }
-  S.dashTrend = (sems || []).slice().reverse().map((s) => ({
+  S.dashTrend = sems.slice().reverse().map((s) => ({
     numero: s.numero, annee: s.annee, total: byS[s.id] || 0, current: S.semaine && s.id === S.semaine.id,
   }));
 }
