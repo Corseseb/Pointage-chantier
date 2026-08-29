@@ -221,6 +221,8 @@
 <style>
   :root[data-theme="light"] { color-scheme: light; }
   :root[data-theme="dark"]  { color-scheme: dark; }
+  .btn.danger { color: var(--red); border-color: var(--red); }
+  .btn.danger:hover { background: var(--red-bg); }
   table.ts td.need { background: var(--orange-bg); }
   table.ts td.need select, table.ts td.need input { box-shadow: inset 0 0 0 1.5px var(--orange); }
   table.ts td.need select:focus, table.ts td.need input:focus { box-shadow: inset 0 0 0 2px var(--accent); }
@@ -446,7 +448,13 @@ async function saveSheet(silent) {
     if (isStaff() && S.focusUser && S.focusUser !== S.profile.id) {
       await sb.from("journal").insert({ feuille_id: S.sheet.id, action: "correction", auteur_id: S.profile.id }).then(() => {}, () => {});
     }
-    await loadSheetFor(S.focusUser);
+    // si toutes les lignes ont été supprimées, on supprime la feuille (ne pas polluer l'historique / le graphique)
+    if (S.sheet && S.lignes.length === 0) {
+      await sb.from("feuilles").delete().eq("id", S.sheet.id).then(() => {}, () => {});
+      S.sheet = null; S.deleted = [];
+    } else {
+      await loadSheetFor(S.focusUser);
+    }
     if (!silent) toast("Pointage enregistré.");
   } catch (e) { alert("Enregistrement impossible : " + errMsg(e)); }
   S.busy = false; render();
@@ -487,7 +495,7 @@ async function loadDashboard() {
     const { data: fs } = await sb.from("feuilles").select("semaine_id, lignes(h_lundi,h_mardi,h_mercredi,h_jeudi,h_vendredi)").in("semaine_id", ids);
     (fs || []).forEach((f) => byS[f.semaine_id] = (byS[f.semaine_id] || 0) + total(f.lignes || []));
   }
-  S.dashTrend = sems.slice().reverse().map((s) => ({
+  S.dashTrend = sems.filter((s) => (byS[s.id] || 0) > 0).slice().reverse().map((s) => ({
     numero: s.numero, annee: s.annee, total: byS[s.id] || 0, current: S.semaine && s.id === S.semaine.id,
   }));
 }
@@ -626,6 +634,7 @@ async function loadHistorique() {
     ]);
     const agg = {};
     (feuilles || []).forEach((f) => {
+      if (!f.lignes || !f.lignes.length) return;   // ignorer les feuilles vides
       const a = agg[f.semaine_id] || (agg[f.semaine_id] = { nb: 0, total: 0, statuts: {} });
       a.nb++; a.total += total(f.lignes || []); a.statuts[f.statut] = (a.statuts[f.statut] || 0) + 1;
     });
@@ -1252,6 +1261,7 @@ function viewRef() {
         '<td>' + (u.email_valide ? '<span class="chip green"><span class="dot"></span>Validé</span>' : '<span class="chip orange"><span class="dot"></span>En attente</span>') + '</td>' +
         '<td>' + (u.actif ? '<span class="chip green"><span class="dot"></span>Actif</span>' : '<span class="chip grey"><span class="dot"></span>Inactif</span>') + '</td>' +
         '<td style="text-align:right;white-space:nowrap">' + (u.email_valide ? "" : '<button class="btn sm" onclick="setUser(\'' + u.id + '\',{email_valide:true})">Valider l\'e-mail</button> ') +
+          '<button class="btn sm" onclick="editUser(\'' + u.id + '\')">Modifier</button> ' +
           '<button class="btn sm" onclick="setUser(\'' + u.id + '\',{actif:' + (!u.actif) + '})">' + (u.actif ? "Désactiver" : "Réactiver") + '</button></td></tr>').join("") +
       '</tbody></table></div>' +
       '<div class="row" style="margin-top:12px">' +
@@ -1348,6 +1358,40 @@ function anneeSuivanteAGenerer() {
 window.setRow = async (tbl, id, patch) => { const { error } = await sb.from(tbl).update(patch).eq("id", id); if (error) return alert(errMsg(error)); refReload(); };
 window.setUser = async (id, patch) => { const { error } = await sb.from("app_users").update(patch).eq("id", id); if (error) return alert(errMsg(error)); refReload(); };
 window.setUserRole = (id, role) => window.setUser(id, { role });
+window.editUser = async (id) => {
+  const u = RA.users.find((x) => x.id === id); if (!u) return;
+  const { count } = await sb.from("feuilles").select("*", { count: "exact", head: true }).eq("app_user_id", id);
+  const nbPointages = count || 0;
+  S.modal = modal("Modifier " + esc(fullName(u)),
+    '<div class="field"><label>Prénom</label><input class="inp" id="eu-p" value="' + esc(u.prenom) + '"></div>' +
+    '<div class="field"><label>Nom</label><input class="inp" id="eu-n" value="' + esc(u.nom) + '"></div>' +
+    '<div class="field"><label>E-mail</label><input class="inp" id="eu-e" value="' + esc(u.email) + '"></div>' +
+    (u.auth_id ? '<div class="alert warn" style="font-size:12px"><span>ℹ</span> Cette personne s\'est déjà connectée : changer l\'e-mail ici ne change pas son identifiant de connexion (utile surtout avant la 1ʳᵉ connexion).</div>' : "") +
+    '<div style="border-top:1px solid var(--line);margin-top:14px;padding-top:12px">' +
+      (nbPointages === 0
+        ? '<button class="btn danger" onclick="deleteUser(\'' + id + '\')">Supprimer définitivement</button><span class="muted" style="font-size:12px;margin-left:8px">Aucun pointage — suppression possible.</span>'
+        : '<span class="muted" style="font-size:12px">' + nbPointages + ' pointage(s) enregistré(s) → suppression impossible. Utilise « Désactiver » pour retirer l\'accès en gardant l\'historique.</span>') +
+    '</div>',
+    '<button class="btn" onclick="closeModal()">Annuler</button><button class="btn primary" onclick="saveUserEdit(\'' + id + '\')">Enregistrer</button>');
+  render();
+};
+window.saveUserEdit = async (id) => {
+  const p = $("#eu-p").value.trim(), n = $("#eu-n").value.trim(), e = $("#eu-e").value.trim().toLowerCase();
+  if (!p || !n || !e) return alert("Prénom, nom et e-mail obligatoires.");
+  const { error } = await sb.from("app_users").update({ prenom: p, nom: n, email: e }).eq("id", id);
+  if (error) return alert(/duplicate|unique/i.test(errMsg(error)) ? "Cette adresse e-mail est déjà utilisée par un autre compte." : errMsg(error));
+  S.modal = null; toast("Collaborateur modifié."); refReload();
+};
+window.deleteUser = async (id) => {
+  const { count } = await sb.from("feuilles").select("*", { count: "exact", head: true }).eq("app_user_id", id);
+  if ((count || 0) > 0) return alert("Impossible : cette personne a des pointages. Utilise « Désactiver ».");
+  if (!confirm("Supprimer définitivement ce collaborateur ? Cette action est irréversible.")) return;
+  const { error } = await sb.from("app_users").delete().eq("id", id);
+  if (error) return alert(errMsg(error));
+  S.modal = null; toast("Collaborateur supprimé.");
+  alert("Si cette personne avait déjà créé un mot de passe, pense à la supprimer aussi dans Supabase → Authentication → Users.");
+  refReload();
+};
 window.addUser = async () => {
   const p = $("#nu-p").value.trim(), n = $("#nu-n").value.trim(), e = $("#nu-e").value.trim().toLowerCase(), r = $("#nu-r").value;
   if (!p || !n || !e) return alert("Prénom, nom et e-mail obligatoires.");
