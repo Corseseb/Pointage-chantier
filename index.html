@@ -616,6 +616,15 @@ async function fetchDetail() {
   });
   return rows;
 }
+// specs §11.2 : séparateur « ; », UTF-8 avec BOM, décimales avec la virgule.
+// La virgule manquait : les nombres partaient avec un point.
+function toCSV(rows) {
+  const head = Object.keys(rows[0]);
+  const cell = (v) => typeof v === "number" ? String(round2(v)).replace(".", ",") : String(v == null ? "" : v);
+  return [head.join(";")]
+    .concat(rows.map((r) => head.map((h) => '"' + cell(r[h]).replace(/"/g, "'") + '"').join(";")))
+    .join("\r\n");
+}
 function dateOfDay(i) {
   const d = new Date(S.semaine.date_debut + "T00:00:00"); d.setDate(d.getDate() + i);
   return ("0" + d.getDate()).slice(-2) + "/" + ("0" + (d.getMonth() + 1)).slice(-2) + "/" + d.getFullYear();
@@ -627,8 +636,7 @@ function download(blob, name) {
 async function exportCSV() {
   const rows = await fetchDetail();
   if (!rows.length) return alert("Aucune donnée à exporter pour cette semaine.");
-  const head = Object.keys(rows[0]);
-  const csv = [head.join(";")].concat(rows.map((r) => head.map((h) => '"' + String(r[h]).replace(/"/g, "'") + '"').join(";"))).join("\r\n");
+  const csv = toCSV(rows);
   download(new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" }), "Pointage_S" + S.semaine.numero + "_" + S.semaine.annee + ".csv");
   await sb.from("exports").insert({ semaine_id: S.semaine.id, format: "csv", auteur_id: S.profile.id }).then(() => {}, () => {});
   toast("Export CSV généré.");
@@ -900,7 +908,12 @@ window.doAuth = async () => {
     }
     if (pass.length < (S.authMode === "signup" ? 8 : 1)) { S.busy = false; render(); return authErr("Mot de passe trop court (8 caractères minimum)."); }
     if (S.authMode === "signup") {
-      const { data, error } = await sb.auth.signUp({ email, password: pass });
+      // Le lien de confirmation doit revenir sur l'application, quelle que soit
+      // la « Site URL » configurée dans Supabase. L'adresse doit tout de même
+      // figurer dans Authentication -> URL Configuration -> Redirect URLs,
+      // sinon Supabase retombe sur la Site URL.
+      const retour = window.location.href.split("#")[0].split("?")[0];
+      const { data, error } = await sb.auth.signUp({ email, password: pass, options: { emailRedirectTo: retour } });
       if (error) throw error;
       if (!data.session) { S.busy = false; S.authMode = "login"; S.authNotice = "Accès créé. Ouvre l'e-mail de confirmation qui vient de t'être envoyé, puis connecte-toi."; render(); return; }
     } else {
@@ -1195,8 +1208,7 @@ async function sendExportEmail() {
     if (!rows.length) { S.busy = false; render(); return alert("Aucune donnée à exporter pour cette semaine."); }
     let contentBase64, filename, mime;
     if (fmt === "csv") {
-      const head = Object.keys(rows[0]);
-      const csv = [head.join(";")].concat(rows.map((r) => head.map((h) => '"' + String(r[h]).replace(/"/g, "'") + '"').join(";"))).join("\r\n");
+      const csv = toCSV(rows);
       contentBase64 = btoa(unescape(encodeURIComponent("﻿" + csv)));
       filename = "Pointage_S" + S.semaine.numero + "_" + S.semaine.annee + ".csv";
       mime = "text/csv";
@@ -1222,9 +1234,18 @@ async function sendExportEmail() {
 function buildWorkbook(rows) {
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Détail");
-  const byC = {}; rows.forEach((r) => byC[r.Collaborateur] = (byC[r.Collaborateur] || 0) + r.Heures);
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(Object.entries(byC).map(([k, v]) => ({ Collaborateur: k, "Total heures": v }))), "Synthèse collaborateurs");
-  const agg = (key) => { const m = {}; rows.forEach((r) => m[r[key]] = (m[r[key]] || 0) + r.Heures); return Object.entries(m).map(([k, v]) => ({ [key]: k, "Total heures": v })); };
+  // specs §11.1 : Collaborateur, E-mail, Total heures — l'e-mail manquait.
+  // Les sommes sont arrondies : sans cela, 8,1 + 8,2 arrivait dans le classeur
+  // sous la forme 16,299999999999997 (constat CALC-01).
+  const byC = {};
+  rows.forEach((r) => {
+    const c = byC[r.Collaborateur] || (byC[r.Collaborateur] = { "E-mail": r["E-mail"], h: 0 });
+    c.h += r.Heures;
+  });
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    Object.entries(byC).map(([k, v]) => ({ Collaborateur: k, "E-mail": v["E-mail"], "Total heures": round2(v.h) }))
+  ), "Synthèse collaborateurs");
+  const agg = (key) => { const m = {}; rows.forEach((r) => m[r[key]] = (m[r[key]] || 0) + r.Heures); return Object.entries(m).map(([k, v]) => ({ [key]: k, "Total heures": round2(v) })); };
   const synth = [{ A: "Par bâtiment" }].concat(agg("Bâtiment"), [{}], [{ A: "Par niveau" }], agg("Niveau"), [{}], [{ A: "Par travaux" }], agg("Travaux"), [{}], [{ A: "Par imputation" }], agg("Imputation"));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(synth, { skipHeader: true }), "Synthèse chantier");
   return wb;
