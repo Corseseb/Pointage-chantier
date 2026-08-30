@@ -499,12 +499,22 @@ async function setStatut(statut, extra) {
 
 /* ---------- dashboard ---------- */
 async function loadDashboard() {
-  const [{ data: collabs }, { data: feuilles }] = await Promise.all([
-    sb.from("app_users").select("*").eq("role", "collaborateur").eq("actif", true).order("nom"),
+  // Tous les comptes actifs, pas seulement ceux de rôle « collaborateur ».
+  // Depuis que le staff peut saisir son propre pointage, ses heures partaient dans
+  // l'export et étaient verrouillées à la validation de la semaine sans jamais
+  // apparaître ici : le total du tableau de bord ne correspondait pas au fichier
+  // transmis à la comptabilité.
+  const [{ data: users }, { data: feuilles }] = await Promise.all([
+    sb.from("app_users").select("*").eq("actif", true).order("nom"),
     sb.from("feuilles").select("id, app_user_id, statut, lignes(h_lundi,h_mardi,h_mercredi,h_jeudi,h_vendredi)").eq("semaine_id", S.semaine.id),
   ]);
   const byUser = {}; (feuilles || []).forEach((f) => byUser[f.app_user_id] = f);
-  S.dash = (collabs || []).map((u) => {
+  // Un collaborateur est toujours listé, même sans pointage — c'est un manquant à
+  // relancer. Un responsable ou un admin n'apparaît que s'il a effectivement pointé,
+  // pour ne pas encombrer la liste de comptes qui n'ont pas vocation à saisir.
+  const liste = (users || []).filter((u) => u.role === "collaborateur"
+    || (byUser[u.id] && (byUser[u.id].lignes || []).length));
+  S.dash = liste.map((u) => {
     const f = byUser[u.id];
     const st = (!f || !f.lignes || !f.lignes.length) ? "manquant" : f.statut;
     return { u, statut: st, total: f ? total(f.lignes || []) : 0 };
@@ -1106,7 +1116,9 @@ function viewDashboard() {
   const semVerrou = d.length > 0 && d.some((r) => r.statut === "verrouille") && d.every((r) => r.statut === "verrouille" || r.statut === "manquant");
   const rows = d.map((r) => {
     const m = STATE_META[r.statut];
-    return '<tr><td><b>' + esc(fullName(r.u)) + '</b><div class="muted" style="font-size:12px">' + esc(r.u.email) + '</div></td>' +
+    const rolePill = r.u.role !== "collaborateur"
+      ? ' <span class="rolepill" style="font-size:10px;vertical-align:middle">' + ROLE_SHORT[r.u.role] + '</span>' : "";
+    return '<tr><td><b>' + esc(fullName(r.u)) + '</b>' + rolePill + '<div class="muted" style="font-size:12px">' + esc(r.u.email) + '</div></td>' +
       '<td class="num">' + (r.statut === "manquant" ? "—" : fmt(r.total) + " h") + '</td>' +
       '<td><span class="chip ' + m.chip + '"><span class="dot"></span>' + m.txt + '</span></td>' +
       '<td style="text-align:right"><button class="btn sm" onclick="openCollab(\'' + r.u.id + '\')">Voir</button></td></tr>';
