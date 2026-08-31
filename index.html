@@ -264,7 +264,7 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 // et à reporter dans ../VERSIONS.md avec la description de la correction.
 // Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
 // quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
-const APP_VERSION = "1.4";
+const APP_VERSION = "1.5";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
@@ -637,10 +637,18 @@ async function deverrouillerSemaine() {
 }
 
 /* ---------- export ---------- */
+// Seuls les pointages VALIDÉS partent en comptabilité. Un brouillon n'a été ni
+// relu par son auteur ni contrôlé par le responsable : il n'a pas à être payé.
+// Les feuilles écartées sont comptées pour être annoncées à l'écran — un total
+// qui baisse sans explication inquiète plus qu'il ne rassure.
+const STATUTS_EXPORTES = ["valide", "verrouille"];
 async function fetchDetail() {
-  const { data: feuilles, error } = await sb.from("feuilles")
+  const { data: toutes, error } = await sb.from("feuilles")
     .select("app_user_id, statut, lignes(*)").eq("semaine_id", S.semaine.id);
   if (error) { alert("Export impossible : " + errMsg(error)); return []; }
+  const feuilles = (toutes || []).filter((f) => STATUTS_EXPORTES.includes(f.statut));
+  const ecartees = (toutes || []).filter((f) => !STATUTS_EXPORTES.includes(f.statut));
+  S.exportEcarte = { feuilles: ecartees.length, heures: ecartees.reduce((n, f) => n + total(f.lignes || []), 0) };
   const uids = [...new Set((feuilles || []).map((f) => f.app_user_id))];
   let umap = {};
   if (uids.length) {
@@ -684,20 +692,31 @@ function download(blob, name) {
   const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name;
   document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
 }
+function rienAExporter() {
+  const e = S.exportEcarte || { feuilles: 0 };
+  return e.feuilles
+    ? "Aucun pointage validé pour cette semaine : " + e.feuilles + " feuille(s) sont encore en brouillon ou à contrôler. Valide-les avant d'exporter."
+    : "Aucune donnée à exporter pour cette semaine.";
+}
+function messageEcartees() {
+  const e = S.exportEcarte || { feuilles: 0, heures: 0 };
+  if (!e.feuilles) return "";
+  return " — " + e.feuilles + " feuille(s) non validée(s) écartée(s), soit " + fmt(e.heures) + " h.";
+}
 async function exportCSV() {
   const rows = await fetchDetail();
-  if (!rows.length) return alert("Aucune donnée à exporter pour cette semaine.");
+  if (!rows.length) return alert(rienAExporter());
   const csv = toCSV(rows);
   download(new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" }), "Pointage_S" + S.semaine.numero + "_" + S.semaine.annee + ".csv");
   await sb.from("exports").insert({ semaine_id: S.semaine.id, format: "csv", auteur_id: S.profile.id }).then(() => {}, () => {});
-  toast("Export CSV généré.");
+  toast("Export CSV généré" + messageEcartees());
 }
 async function exportXLSX() {
   const rows = await fetchDetail();
-  if (!rows.length) return alert("Aucune donnée à exporter pour cette semaine.");
+  if (!rows.length) return alert(rienAExporter());
   XLSX.writeFile(buildWorkbook(rows), "Pointage_S" + S.semaine.numero + "_" + S.semaine.annee + ".xlsx");
   await sb.from("exports").insert({ semaine_id: S.semaine.id, format: "excel", auteur_id: S.profile.id }).then(() => {}, () => {});
-  toast("Export Excel généré.");
+  toast("Export Excel généré" + messageEcartees());
 }
 
 /* ---------- historique ---------- */
@@ -1247,11 +1266,14 @@ window.askValiderSemaine = (v, n) => {
 function viewExport() {
   return '<h1>Export — Semaine ' + S.semaine.numero + '</h1><div class="card">' +
     '<div class="between"><div><h3 style="margin:0">' + esc(semLabel(S.semaine)) + '</h3>' +
-      '<div class="muted">L\'export ne contient que cette semaine.</div></div>' +
+      '<div class="muted">L\'export ne contient que cette semaine, et seulement les pointages validés.</div></div>' +
       '<div class="row">' + weekPicker() + '<button class="btn" onclick="exportCSV()">↓ CSV</button>' +
       '<button class="btn primary" onclick="exportXLSX()">↓ Excel (3 feuilles)</button>' +
       '<button class="btn" onclick="goto(\'email\')">✉ Envoyer par e-mail</button></div></div>' +
     '<div class="alert ok" style="margin-top:8px"><span>ℹ</span> Feuille Excel : <b>Détail</b> · <b>Synthèse collaborateurs</b> · <b>Synthèse chantier</b> (bâtiment / niveau / travaux / imputation).</div>' +
+    '<div class="alert warn" style="margin-top:8px"><span>⚠</span><div><b>Seuls les pointages validés ou verrouillés sont exportés.</b> ' +
+      'Les feuilles encore en brouillon ou à contrôler sont écartées, et leur nombre est annoncé après l\'export. ' +
+      'Valide la semaine avant d\'envoyer le fichier à la comptabilité.</div></div>' +
     '</div>';
 }
 function viewEmail() {
@@ -1272,6 +1294,7 @@ function viewEmail() {
     '<div class="row" style="justify-content:flex-end;gap:10px;margin-top:16px"><button class="btn" onclick="goto(\'export\')">Annuler</button>' +
       '<button class="btn primary" onclick="sendExportEmail()">✉ Envoyer</button></div>' +
     '<div class="alert warn" style="margin-top:12px"><span>ℹ</span> L\'e-mail part de <b>axima.pointage.rjh@gmail.com</b>. Demande aux destinataires de vérifier leurs indésirables la première fois.</div>' +
+    '<div class="alert warn" style="margin-top:8px"><span>⚠</span> La pièce jointe ne contiendra que les <b>pointages validés</b> de la semaine.</div>' +
     '</div>';
 }
 async function sendExportEmail() {
@@ -1283,7 +1306,7 @@ async function sendExportEmail() {
   S.busy = true; render();
   try {
     const rows = await fetchDetail();
-    if (!rows.length) { S.busy = false; render(); return alert("Aucune donnée à exporter pour cette semaine."); }
+    if (!rows.length) { S.busy = false; render(); return alert(rienAExporter()); }
     let contentBase64, filename, mime;
     if (fmt === "csv") {
       const csv = toCSV(rows);
@@ -1302,7 +1325,8 @@ async function sendExportEmail() {
     if (error) throw new Error((data && data.error) || error.message);
     if (data && data.error) throw new Error(data.error);
     S.busy = false;
-    S.modal = modal("E-mail envoyé", '<div class="alert ok"><span>✓</span> Export envoyé à : <b>' + esc((data.envoye_a || []).join(", ")) + '</b>.</div>', '<button class="btn primary" onclick="closeModal();goto(\'export\')">OK</button>');
+    S.modal = modal("E-mail envoyé", '<div class="alert ok"><span>✓</span> Export envoyé à : <b>' + esc((data.envoye_a || []).join(", ")) + '</b>.</div>' +
+      (S.exportEcarte && S.exportEcarte.feuilles ? '<div class="alert warn"><span>⚠</span><div><b>' + S.exportEcarte.feuilles + ' feuille(s) non validée(s)</b> ont été écartées de l\'envoi, soit ' + fmt(S.exportEcarte.heures) + ' h. Valide-les et renvoie l\'export si elles doivent être comptées.</div></div>' : ""), '<button class="btn primary" onclick="closeModal();goto(\'export\')">OK</button>');
     render();
   } catch (e) {
     S.busy = false; render();
