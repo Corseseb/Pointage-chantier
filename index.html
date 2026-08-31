@@ -264,7 +264,7 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 // et à reporter dans ../VERSIONS.md avec la description de la correction.
 // Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
 // quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
-const APP_VERSION = "1.2";
+const APP_VERSION = "1.3";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
@@ -304,6 +304,24 @@ const initials = (u) => (u.prenom[0] + u.nom[0]).toUpperCase();
 const isStaff = () => S.profile && (S.profile.role === "responsable" || S.profile.role === "admin");
 const isAdmin = () => S.profile && S.profile.role === "admin";
 const semLabel = (s) => s ? `Semaine ${s.numero} — du ${frDate(s.date_debut)} au ${frDate(s.date_fin)}` : "";
+// ---- Présence attendue d'un collaborateur sur une semaine donnée ----
+// date_arrivee / date_sortie sont facultatives (voir SQL/07). Vides = présent
+// sur toute la période, soit exactement le comportement d'avant la v1.3.
+function presentSemaine(u, sem) {
+  if (!sem) return true;
+  const a = u.date_arrivee ? String(u.date_arrivee).slice(0, 10) : null;
+  const z = u.date_sortie ? String(u.date_sortie).slice(0, 10) : null;
+  if (a && a > String(sem.date_fin).slice(0, 10)) return false;    // pas encore arrivé
+  if (z && z < String(sem.date_debut).slice(0, 10)) return false;  // déjà parti
+  return true;
+}
+// Libellé « S40 2026 » de la semaine correspondant à une date de présence.
+function semaineDeDate(d) {
+  if (!d) return null;
+  const j = String(d).slice(0, 10);
+  const s = (S.semaines || []).find((x) => String(x.date_debut).slice(0, 10) <= j && j <= String(x.date_fin).slice(0, 10));
+  return s ? "S" + s.numero + " " + s.annee : frDate(j);
+}
 function frDate(d) { const p = String(d).slice(0, 10).split("-"); return p[2] + "/" + p[1] + "/" + p[0]; }
 function frDateTime(iso) { try { const d = new Date(iso); return ("0" + d.getDate()).slice(-2) + "/" + ("0" + (d.getMonth() + 1)).slice(-2) + " à " + ("0" + d.getHours()).slice(-2) + "h" + ("0" + d.getMinutes()).slice(-2); } catch (e) { return ""; } }
 function toast(msg) {
@@ -510,20 +528,28 @@ async function loadDashboard() {
   // l'export et étaient verrouillées à la validation de la semaine sans jamais
   // apparaître ici : le total du tableau de bord ne correspondait pas au fichier
   // transmis à la comptabilité.
+  // Tous les comptes sont chargés, y compris les inactifs : un collaborateur parti
+  // et désactivé doit rester visible sur les semaines PASSÉES où il a pointé,
+  // sinon l'historique du tableau de bord changerait rétroactivement.
   const [{ data: users }, { data: feuilles }] = await Promise.all([
-    sb.from("app_users").select("*").eq("actif", true).order("nom"),
+    sb.from("app_users").select("*").order("nom"),
     sb.from("feuilles").select("id, app_user_id, statut, lignes(h_lundi,h_mardi,h_mercredi,h_jeudi,h_vendredi)").eq("semaine_id", S.semaine.id),
   ]);
   const byUser = {}; (feuilles || []).forEach((f) => byUser[f.app_user_id] = f);
-  // Tout compte actif du référentiel doit faire son pointage — collaborateur,
-  // responsable travaux comme administrateur. Chacun est donc listé toutes les
-  // semaines, y compris celles où il n'a rien saisi : c'est là qu'il faut le relancer.
-  const liste = (users || []);
-  S.dash = liste.map((u) => {
+  // Tout compte du référentiel doit faire son pointage — collaborateur,
+  // responsable travaux comme administrateur — mais seulement sur les semaines
+  // où il est effectivement présent (date_arrivee / date_sortie, cf. SQL/07).
+  //
+  // Règle de sécurité : une feuille existante est TOUJOURS affichée, même hors
+  // période de présence. Une date d'arrivée ou de sortie mal saisie ne peut donc
+  // jamais faire disparaître silencieusement des heures de l'écran ni du total.
+  S.dash = (users || []).map((u) => {
     const f = byUser[u.id];
+    const attendu = u.actif && presentSemaine(u, S.semaine);
+    if (!attendu && !f) return null;
     const st = (!f || !f.lignes || !f.lignes.length) ? "manquant" : f.statut;
-    return { u, statut: st, total: f ? total(f.lignes || []) : 0 };
-  });
+    return { u, statut: st, total: f ? total(f.lignes || []) : 0, horsPeriode: !attendu };
+  }).filter(Boolean);
   // tendance : les 12 dernières semaines QUI ONT des pointages (ordre chronologique)
   // PERF-01 : l'agrégation est faite en base (rpc stats_semaines) — avant, cet écran
   // rapatriait TOUTES les feuilles puis TOUTES leurs lignes, et devenait faux au-delà
@@ -1124,7 +1150,11 @@ function viewDashboard() {
     const m = STATE_META[r.statut];
     const rolePill = r.u.role !== "collaborateur"
       ? ' <span class="rolepill" style="font-size:10px;vertical-align:middle">' + ROLE_SHORT[r.u.role] + '</span>' : "";
-    return '<tr><td><b>' + esc(fullName(r.u)) + '</b>' + rolePill + '<div class="muted" style="font-size:12px">' + esc(r.u.email) + '</div></td>' +
+    // Ligne conservée parce qu'il y a des heures saisies, alors que la personne
+    // n'est pas censée être présente cette semaine-là : signalé, jamais masqué.
+    const horsP = r.horsPeriode
+      ? ' <span class="chip orange" style="font-size:10px;vertical-align:middle" title="Des heures sont saisies alors que cette personne n\'est pas déclarée présente sur cette semaine (voir Référentiel → Collaborateurs).">Hors période</span>' : "";
+    return '<tr><td><b>' + esc(fullName(r.u)) + '</b>' + rolePill + horsP + '<div class="muted" style="font-size:12px">' + esc(r.u.email) + '</div></td>' +
       '<td class="num">' + (r.statut === "manquant" ? "—" : fmt(r.total) + " h") + '</td>' +
       '<td><span class="chip ' + m.chip + '"><span class="dot"></span>' + m.txt + '</span></td>' +
       '<td style="text-align:right"><button class="btn sm" onclick="openCollab(\'' + r.u.id + '\')">Voir</button></td></tr>';
@@ -1138,7 +1168,7 @@ function viewDashboard() {
     (isAdmin() && S.backup.due ? '<div class="alert bad" style="margin-top:14px"><span>⚠</span><div><b>Sauvegarde à faire</b> — la semaine ' + esc(S.backup.semaine) + ' est validée mais n\'a pas encore été sauvegardée. <a onclick="ouvrirSauvegarde()">Faire la sauvegarde</a></div></div>' : "") +
     (anneeSuivanteAGenerer() ? '<div class="alert warn" style="margin-top:14px"><span>📅</span><div><b>Fin d\'année</b> — pensez à générer les semaines de <b>' + anneeSuivanteAGenerer() + '</b>. ' + (isAdmin() ? '<a onclick="ouvrirSemaines()">Générer maintenant</a>' : 'À faire par l\'administrateur (Référentiel → Semaines).') + '</div></div>' : "") +
     '<div class="kpis" style="margin-top:14px">' +
-      '<div class="kpi"><div class="n">' + d.length + '</div><div class="l">Collaborateurs</div></div>' +
+      '<div class="kpi"><div class="n">' + d.length + '</div><div class="l">Collaborateurs présents</div></div>' +
       '<div class="kpi"><div class="n" style="color:var(--green)">' + c.ok + '</div><div class="l">Complets</div></div>' +
       '<div class="kpi"><div class="n" style="color:var(--orange)">' + c.ctrl + '</div><div class="l">À contrôler</div></div>' +
       '<div class="kpi"><div class="n" style="color:var(--red)">' + c.miss + '</div><div class="l">Non renseignés</div></div>' +
@@ -1146,7 +1176,7 @@ function viewDashboard() {
     '<div class="card" style="margin-top:14px"><div class="between" style="margin-bottom:10px"><h3 style="margin:0">État des pointages</h3>' +
       '<span class="muted">' + validated + ' / ' + d.length + ' validés</span></div>' +
       '<div class="grid-wrap"><table class="grid"><thead><tr><th>Collaborateur</th><th class="num">Heures</th><th>État</th><th></th></tr></thead>' +
-      '<tbody>' + (rows || '<tr><td colspan="4" class="muted">Aucun collaborateur actif.</td></tr>') + '</tbody></table></div></div>' +
+      '<tbody>' + (rows || '<tr><td colspan="4" class="muted">Aucun collaborateur présent sur cette semaine.</td></tr>') + '</tbody></table></div></div>' +
     '<div class="card" style="margin-top:14px"><h3 style="margin-top:0">Évolution des heures pointées</h3>' +
       '<div class="muted" style="font-size:12px;margin-bottom:6px">Total d\'heures par semaine — 12 dernières semaines.</div>' +
       trendChart(S.dashTrend) + '</div>';
@@ -1314,10 +1344,11 @@ function viewRef() {
       '<p class="muted" style="font-size:12px;margin-top:8px">Conseil : ne génère les semaines de l\'année suivante qu\'en fin d\'année (une vignette de rappel apparaîtra sur le tableau de bord ~6 semaines avant), pour éviter que les collaborateurs se trompent d\'année.</p>';
   } else if (S.refTab === "collaborateurs") {
     inner = '<p class="muted" style="font-size:13px">Ajoute un collaborateur puis <b>valide son e-mail</b> : il pourra alors créer son mot de passe (onglet « Créer mon mot de passe » de la page de connexion).</p>' +
-      '<div class="grid-wrap"><table class="grid"><thead><tr><th>Prénom</th><th>Nom</th><th>E-mail</th><th>Rôle</th><th>E-mail</th><th>Compte</th><th></th></tr></thead><tbody>' +
+      '<div class="grid-wrap"><table class="grid"><thead><tr><th>Prénom</th><th>Nom</th><th>E-mail</th><th>Rôle</th><th>Présence</th><th>E-mail</th><th>Compte</th><th></th></tr></thead><tbody>' +
       RA.users.map((u) => '<tr><td>' + esc(u.prenom) + '</td><td>' + esc(u.nom) + '</td><td class="muted">' + esc(u.email) + '</td>' +
         '<td><select class="inp" style="min-width:150px" onchange="setUserRole(\'' + u.id + '\',this.value)">' +
           ["collaborateur", "responsable", "admin"].map((r) => '<option value="' + r + '"' + (u.role === r ? " selected" : "") + '>' + ROLE_LABEL[r] + '</option>').join("") + '</select></td>' +
+        '<td class="muted" style="font-size:12px;white-space:nowrap">' + esc(presenceLabel(u)) + '</td>' +
         '<td>' + (u.email_valide ? '<span class="chip green"><span class="dot"></span>Validé</span>' : '<span class="chip orange"><span class="dot"></span>En attente</span>') + '</td>' +
         '<td>' + (u.actif ? '<span class="chip green"><span class="dot"></span>Actif</span>' : '<span class="chip grey"><span class="dot"></span>Inactif</span>') + '</td>' +
         '<td style="text-align:right;white-space:nowrap">' + (u.email_valide ? "" : '<button class="btn sm" onclick="setUser(\'' + u.id + '\',{email_valide:true})">Valider l\'e-mail</button> ') +
@@ -1329,7 +1360,9 @@ function viewRef() {
         '<input class="inp" id="nu-n" placeholder="Nom" style="max-width:130px">' +
         '<input class="inp" id="nu-e" placeholder="e-mail" style="max-width:200px">' +
         '<select class="inp" id="nu-r" style="max-width:160px">' + ["collaborateur", "responsable", "admin"].map((r) => '<option value="' + r + '">' + ROLE_LABEL[r] + '</option>').join("") + '</select>' +
-        '<button class="btn" onclick="addUser()">＋ Ajouter</button></div>';
+        '<select class="inp" id="nu-a" style="max-width:230px" title="Semaine d\'arrivée">' + semaineOptions(null, "debut", "— présent depuis toujours —") + '</select>' +
+        '<button class="btn" onclick="addUser()">＋ Ajouter</button></div>' +
+      '<p class="muted" style="font-size:12px;margin-top:8px">Pour un arrivé en cours d\'année, choisis sa <b>semaine d\'arrivée</b> : il ne sera pas compté « Non renseigné » sur les semaines précédentes. La semaine de sortie se renseigne plus tard via « Modifier ».</p>';
   } else if (S.refTab === "travaux") {
     inner = '<p class="muted" style="font-size:13px">Une typologie = une imputation (relation fixe). L\'imputation s\'affiche automatiquement à la saisie.</p>' +
       '<div class="grid-wrap"><table class="grid"><thead><tr><th>Typologie</th><th>Imputation</th><th>État</th><th></th></tr></thead><tbody>' +
@@ -1415,6 +1448,23 @@ function anneeSuivanteAGenerer() {
   const suiv = now.getFullYear() + 1;
   return S.semaines.some((s) => s.annee === suiv) ? null : suiv;
 }
+// « Présence » d'un collaborateur, en semaines, tel qu'affiché au Référentiel.
+function presenceLabel(u) {
+  if (!u.date_arrivee && !u.date_sortie) return "Toute la période";
+  return (u.date_arrivee ? "dès " + semaineDeDate(u.date_arrivee) : "depuis toujours") +
+    " → " + (u.date_sortie ? "jusqu'à " + semaineDeDate(u.date_sortie) : "toujours présent");
+}
+// Sélecteur de SEMAINE qui enregistre une DATE : le lundi pour une arrivée,
+// le vendredi pour une sortie (cf. commentaire en tête de SQL/07).
+function semaineOptions(dateCourante, borne, vide) {
+  const j = dateCourante ? String(dateCourante).slice(0, 10) : "";
+  return '<option value="">' + vide + '</option>' +
+    (RA.semaines || []).map((s) => {
+      const val = borne === "debut" ? String(s.date_debut).slice(0, 10) : String(s.date_fin).slice(0, 10);
+      const dans = String(s.date_debut).slice(0, 10) <= j && j <= String(s.date_fin).slice(0, 10);
+      return '<option value="' + val + '"' + (dans ? " selected" : "") + '>S' + s.numero + ' ' + s.annee + ' (du ' + frDate(s.date_debut) + ' au ' + frDate(s.date_fin) + ')</option>';
+    }).join("");
+}
 window.setRow = async (tbl, id, patch) => { const { error } = await sb.from(tbl).update(patch).eq("id", id); if (error) return alert(errMsg(error)); refReload(); };
 window.setUser = async (id, patch) => { const { error } = await sb.from("app_users").update(patch).eq("id", id); if (error) return alert(errMsg(error)); refReload(); };
 window.setUserRole = (id, role) => window.setUser(id, { role });
@@ -1427,6 +1477,12 @@ window.editUser = async (id) => {
     '<div class="field"><label>Nom</label><input class="inp" id="eu-n" value="' + esc(u.nom) + '"></div>' +
     '<div class="field"><label>E-mail</label><input class="inp" id="eu-e" value="' + esc(u.email) + '"></div>' +
     (u.auth_id ? '<div class="alert warn" style="font-size:12px"><span>ℹ</span> Cette personne s\'est déjà connectée : changer l\'e-mail ici ne change pas son identifiant de connexion (utile surtout avant la 1ʳᵉ connexion).</div>' : "") +
+    '<div style="border-top:1px solid var(--line);margin-top:14px;padding-top:12px"><b style="font-size:13px">Présence</b>' +
+      '<p class="muted" style="font-size:12px;margin:4px 0 10px">Le tableau de bord ne réclame un pointage que sur les semaines de présence. Laisser vide = présent sur toute la période.</p>' +
+      '<div class="field"><label>Semaine d\'arrivée</label><select class="inp" id="eu-a">' + semaineOptions(u.date_arrivee, "debut", "— depuis toujours —") + '</select></div>' +
+      '<div class="field"><label>Semaine de sortie</label><select class="inp" id="eu-z">' + semaineOptions(u.date_sortie, "fin", "— toujours présent —") + '</select></div>' +
+      '<p class="muted" style="font-size:12px">Une sortie ne retire pas l\'accès à l\'application : pour cela, utilise « Désactiver ». Un départ définitif demande les deux.</p>' +
+    '</div>' +
     '<div style="border-top:1px solid var(--line);margin-top:14px;padding-top:12px">' +
       (nbPointages === 0
         ? '<button class="btn danger" onclick="deleteUser(\'' + id + '\')">Supprimer définitivement</button><span class="muted" style="font-size:12px;margin-left:8px">Aucun pointage — suppression possible.</span>'
@@ -1438,7 +1494,9 @@ window.editUser = async (id) => {
 window.saveUserEdit = async (id) => {
   const p = $("#eu-p").value.trim(), n = $("#eu-n").value.trim(), e = $("#eu-e").value.trim().toLowerCase();
   if (!p || !n || !e) return alert("Prénom, nom et e-mail obligatoires.");
-  const { error } = await sb.from("app_users").update({ prenom: p, nom: n, email: e }).eq("id", id);
+  const a = $("#eu-a").value || null, z = $("#eu-z").value || null;
+  if (a && z && z < a) return alert("La semaine de sortie ne peut pas précéder la semaine d'arrivée.");
+  const { error } = await sb.from("app_users").update({ prenom: p, nom: n, email: e, date_arrivee: a, date_sortie: z }).eq("id", id);
   if (error) return alert(/duplicate|unique/i.test(errMsg(error)) ? "Cette adresse e-mail est déjà utilisée par un autre compte." : errMsg(error));
   S.modal = null; toast("Collaborateur modifié."); refReload();
 };
@@ -1458,7 +1516,8 @@ window.addUser = async () => {
   // SEC-02 : l'adresse n'est PAS validée d'office. L'admin la valide explicitement,
   // juste avant d'envoyer l'invitation — c'est ce qui referme la fenêtre pendant
   // laquelle un tiers pouvait réclamer le compte.
-  const { error } = await sb.from("app_users").insert({ prenom: p, nom: n, email: e, role: r, email_valide: false, actif: true });
+  const a = $("#nu-a").value || null;
+  const { error } = await sb.from("app_users").insert({ prenom: p, nom: n, email: e, role: r, email_valide: false, actif: true, date_arrivee: a });
   if (error) return alert(errMsg(error));
   toast("Collaborateur ajouté. Valide son e-mail au moment de l'inviter."); refReload();
 };
