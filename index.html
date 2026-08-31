@@ -264,7 +264,7 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 // et à reporter dans ../VERSIONS.md avec la description de la correction.
 // Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
 // quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
-const APP_VERSION = "1.3";
+const APP_VERSION = "1.4";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
@@ -287,6 +287,7 @@ const S = {
   focusUser: null, focusUserObj: null,
   sheet: null, lignes: [], deleted: [],
   dash: null, modal: null, busy: false,
+  mesSemainesPointees: [],   // semaine_id où l'utilisateur connecté a déjà une feuille
 };
 
 /* ---------- utils ---------- */
@@ -404,6 +405,7 @@ async function boot() {
     S.profile = prof;
     await loadRef();
     await loadSemaines();
+    await loadMesSemainesPointees();
     S.view = isStaff() ? "dashboard" : "sheet";
     if (isStaff()) { await loadDashboard(); await loadBackupState(); }
     else await loadSheetFor(S.profile.id);
@@ -432,6 +434,14 @@ function semaineCourante() {
   return S.semaines.find((s) => d(s.date_debut) <= t && t <= d(s.date_fin))   // semaine en cours (lun→ven)
     || S.semaines.find((s) => d(s.date_debut) <= t)                            // sinon la plus récente déjà commencée (week-end)
     || S.semaines[S.semaines.length - 1];                                      // sinon la plus proche à venir
+}
+// Semaines où l'utilisateur connecté a DÉJÀ une feuille. Elles restent accessibles
+// même si elles tombent hors de sa période de présence : une date d'arrivée saisie
+// après coup ne doit jamais enfermer des heures que plus personne ne peut corriger.
+async function loadMesSemainesPointees() {
+  if (!S.profile) return;
+  const { data } = await sb.from("feuilles").select("semaine_id").eq("app_user_id", S.profile.id);
+  S.mesSemainesPointees = (data || []).map((f) => f.semaine_id);
 }
 async function loadSemaines() {
   const { data } = await sb.from("semaines").select("*").order("annee", { ascending: false }).order("numero", { ascending: false });
@@ -1091,13 +1101,33 @@ function weekPicker() {
     const cur = semaineCourante();
     const idx = cur ? S.semaines.findIndex((s) => s.id === cur.id) : -1;
     if (idx >= 0) list = S.semaines.slice(Math.max(0, idx - 4), idx + 6);
+    // …puis restreinte à sa période de présence : un arrivé en S39 ne se voit pas
+    // proposer S36, plutôt que de saisir une semaine entière pour se voir refuser
+    // à la validation. Le staff, lui, garde accès à toutes les semaines : c'est lui
+    // qui corrige les erreurs de saisie.
+    list = list.filter((s) => presentSemaine(S.profile, s) || S.mesSemainesPointees.indexOf(s.id) >= 0);
+    // Filet : si la fenêtre glissante ne croise pas la période de présence, on
+    // retombe sur les semaines de présence les plus proches plutôt que sur rien.
+    if (!list.length) {
+      list = S.semaines.filter((s) => presentSemaine(S.profile, s) || S.mesSemainesPointees.indexOf(s.id) >= 0).slice(0, 10);
+    }
+    // La semaine affichée doit toujours figurer dans la liste, sinon le sélecteur
+    // montrerait une semaine que l'utilisateur ne peut pas resélectionner.
+    if (S.semaine && !list.some((s) => s.id === S.semaine.id) && list.length) S.semaine = list[0];
   }
   return '<div class="weeknav"><select class="inp" style="max-width:280px" onchange="changeWeek(this.value)">' +
     list.map((s) => '<option value="' + s.id + '"' + (S.semaine && s.id === S.semaine.id ? " selected" : "") + '>' + esc(semLabel(s)) + '</option>').join("") +
     '</select></div>';
 }
 window.changeWeek = async (id) => {
-  S.semaine = S.semaines.find((s) => s.id === id); S.busy = true; render();
+  const cible = S.semaines.find((s) => s.id === id);
+  if (!cible) return;
+  // Garde-fou : même en forçant la valeur du sélecteur, un collaborateur ne peut
+  // pas ouvrir une semaine hors de sa période de présence (sauf s'il y a déjà pointé).
+  if (!isStaff() && !presentSemaine(S.profile, cible) && S.mesSemainesPointees.indexOf(id) < 0) {
+    return alert("Cette semaine ne fait pas partie de votre période de présence. Contactez votre responsable si c'est une erreur.");
+  }
+  S.semaine = cible; S.busy = true; render();
   if (isStaff() && (S.view === "dashboard")) await loadDashboard();
   else await loadSheetFor(S.focusUser || S.profile.id);
   S.busy = false; render();
