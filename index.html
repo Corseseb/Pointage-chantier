@@ -260,6 +260,12 @@ const SB_URL = "https://qdsgmnmlrgrjqajmaejj.supabase.co";
 const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFkc2dtbm1scmdyanFham1hZWpqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc5MzQ3ODgsImV4cCI6MjEwMzUxMDc4OH0.AA1vjwMja6OUYGsinBvgN9avysAXEkuQcKqw3cmWSKs";
 const sb = window.supabase.createClient(SB_URL, SB_KEY);
 
+// Numéro de version de l'application. À INCRÉMENTER À CHAQUE DÉPÔT sur GitHub Pages,
+// et à reporter dans ../VERSIONS.md avec la description de la correction.
+// Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
+// quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
+const APP_VERSION = "1.2";
+
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
 const ROLE_LABEL = { collaborateur: "Collaborateur", responsable: "Responsable travaux", admin: "Administrateur" };
@@ -509,11 +515,10 @@ async function loadDashboard() {
     sb.from("feuilles").select("id, app_user_id, statut, lignes(h_lundi,h_mardi,h_mercredi,h_jeudi,h_vendredi)").eq("semaine_id", S.semaine.id),
   ]);
   const byUser = {}; (feuilles || []).forEach((f) => byUser[f.app_user_id] = f);
-  // Un collaborateur est toujours listé, même sans pointage — c'est un manquant à
-  // relancer. Un responsable ou un admin n'apparaît que s'il a effectivement pointé,
-  // pour ne pas encombrer la liste de comptes qui n'ont pas vocation à saisir.
-  const liste = (users || []).filter((u) => u.role === "collaborateur"
-    || (byUser[u.id] && (byUser[u.id].lignes || []).length));
+  // Tout compte actif du référentiel doit faire son pointage — collaborateur,
+  // responsable travaux comme administrateur. Chacun est donc listé toutes les
+  // semaines, y compris celles où il n'a rien saisi : c'est là qu'il faut le relancer.
+  const liste = (users || []);
   S.dash = liste.map((u) => {
     const f = byUser[u.id];
     const st = (!f || !f.lignes || !f.lignes.length) ? "manquant" : f.statut;
@@ -823,6 +828,7 @@ function render() {
         '<span class="txt">' + esc(fullName(S.profile)) + '</span>' +
         '<span class="avatar">' + initials(S.profile) + '</span>' +
         '<button class="btn ghost sm" onclick="doLogout()">Quitter</button>' +
+        '<span class="muted" style="font-size:11px;margin-left:8px" title="Version de l\'application">v' + APP_VERSION + '</span>' +
       '</div></div>' +
       '<div class="main">' + body + '</div></div>' +
     (S.modal || "") + (S.busy ? '<div class="overlay"><div class="muted" style="color:#fff">…</div></div>' : "");
