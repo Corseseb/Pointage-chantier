@@ -264,9 +264,9 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 // et à reporter dans ../VERSIONS.md avec la description de la correction.
 // Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
 // quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
-const APP_VERSION = "2.2";
+const APP_VERSION = "2.4";
 // Date de préparation, posée automatiquement par assemble.py : ne pas la modifier à la main.
-const APP_BUILD = "24/10/2026 à 18h26";
+const APP_BUILD = "24/10/2026 à 18h43";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
@@ -655,15 +655,21 @@ async function loadBackupState() {
     };
   } catch (e) { S.backup = { last: null, due: false, semaine: "" }; }
 }
+// 2e niveau (SQL/11) : c'est la base qui vérifie que TOUTES les feuilles attendues
+// sont validées, verrouille, enregistre le valideur et trace au journal. L'écran
+// ne fait qu'afficher sa réponse — y compris la liste des noms si elle refuse.
 async function validerSemaine() {
   S.busy = true; render();
   try {
-    const ids = [];
-    const { data: fs } = await sb.from("feuilles").select("id").eq("semaine_id", S.semaine.id);
-    (fs || []).forEach((f) => ids.push(f.id));
-    if (ids.length) { const { error } = await sb.from("feuilles").update({ statut: "verrouille", date_validation: new Date().toISOString() }).in("id", ids); if (error) throw error; }
-    await sb.from("journal").insert({ action: "validation_semaine", auteur_id: S.profile.id, details: { semaine: S.semaine.numero } }).then(() => {}, () => {});
-    S.modal = null; await loadDashboard(); await loadBackupState();
+    const { data: res, error } = await sb.rpc("valider_semaine", { p_semaine: S.semaine.id });
+    if (error) throw error;
+    S.modal = null; await loadDashboard();
+    if (!res || !res.ok) {
+      const noms = ((res && res.bloquants) || []).map((b) => "• " + b.nom + " — " + (STATE_META[b.statut] || { txt: b.statut }).txt).join("\n");
+      S.busy = false; render();
+      return alert("Semaine non verrouillée : toutes les feuilles doivent être validées.\n\n" + noms);
+    }
+    await loadBackupState();
     toast("Semaine " + S.semaine.numero + " validée et verrouillée.");
     S.view = "export";
   } catch (e) { alert(errMsg(e)); }
@@ -671,8 +677,8 @@ async function validerSemaine() {
 }
 window.askDeverrouiller = () => {
   S.modal = modal("Déverrouiller la semaine " + S.semaine.numero + " ?",
-    "<p>Les pointages repasseront en statut « À contrôler » et redeviendront corrigeables par le responsable.</p>" +
-    "<p class='muted'>Les collaborateurs ne pourront pas les modifier eux-mêmes tant qu'ils ne sont pas rouverts individuellement.</p>" +
+    "<p>Les pointages repasseront en <b>« Validé »</b> (1er niveau) : corrigez la feuille concernée, puis validez à nouveau la semaine. Rien n'est à refaire pour les autres.</p>" +
+    "<p class='muted'>Les collaborateurs ne pourront pas modifier eux-mêmes leur pointage : la correction se fait par un valideur.</p>" +
     "<div class='field' style='margin-top:10px'><label>Motif (obligatoire)</label><input class='inp' id='dv-motif' placeholder='ex. correction heures Jean Dupont'></div>",
     '<button class="btn" onclick="closeModal()">Annuler</button><button class="btn primary" onclick="deverrouillerSemaine()">Déverrouiller</button>');
   render();
@@ -682,10 +688,9 @@ async function deverrouillerSemaine() {
   if (!motif) return alert("Le motif est obligatoire.");
   S.busy = true; render();
   try {
-    const { data: fs } = await sb.from("feuilles").select("id").eq("semaine_id", S.semaine.id).eq("statut", "verrouille");
-    const ids = (fs || []).map((f) => f.id);
-    if (ids.length) { const { error } = await sb.from("feuilles").update({ statut: "a_controler" }).in("id", ids); if (error) throw error; }
-    await sb.from("journal").insert({ action: "deverrouillage_semaine", motif, auteur_id: S.profile.id, details: { semaine: S.semaine.numero, feuilles: ids.length } }).then(() => {}, () => {});
+    // La base remet les feuilles en « Validé » et trace le motif (SQL/11).
+    const { error } = await sb.rpc("deverrouiller_semaine", { p_semaine: S.semaine.id, p_motif: motif });
+    if (error) throw error;
     S.modal = null; await loadDashboard();
     toast("Semaine " + S.semaine.numero + " déverrouillée.");
   } catch (e) { alert(errMsg(e)); }
@@ -1108,7 +1113,8 @@ function viewSheet(userId, asStaff) {
   // qui n'est pas valideur consulte en lecture seule). Verrouillé : valideur final seul.
   const valideur = asStaff && peutValider(u);
   // Une absence déclarée ne se complète pas : on l'annule d'abord.
-  const staffLocked = asStaff && (!valideur || absent || (st === "verrouille" && !isFinal()));
+  // Verrouillée = intouchable pour tous : on déverrouille la semaine (SQL/11).
+  const staffLocked = asStaff && (!valideur || absent || st === "verrouille");
   const editable = !collabLocked && !staffLocked;
   const INCOMPLET_MSGS = ["Ligne sans activité renseignée", "Activité sans heures saisies", "Données incomplètes"];
   const allErrs = S.lignes.flatMap(lineErrors).filter((e) => !INCOMPLET_MSGS.includes(e));
@@ -1152,7 +1158,7 @@ function viewSheet(userId, asStaff) {
       (!asStaff && transmis ? '<span class="muted">Transmis' + (S.sheet && S.sheet.date_transmission ? ' le ' + frDateTime(S.sheet.date_transmission) : "") + ' — en attente de validation par le responsable.</span>' : "") +
       (!asStaff && (st === "valide" || st === "verrouille") ? '<span class="muted">Pointage ' + (st === "verrouille" ? "verrouillé" : "validé") + ' — non modifiable.</span>' : "") +
       (staffLocked && !absent ? '<span class="muted">' + (!valideur ? "Lecture seule — ce pointage est validé par son responsable."
-        : "Semaine verrouillée — seul un responsable ou directeur travaux peut corriger.") + '</span>' : "") + '</div>' +
+        : "Semaine verrouillée — pour corriger, un responsable ou directeur travaux déverrouille d'abord la semaine.") + '</span>' : "") + '</div>' +
     (absent ? '<div class="alert ok" style="margin:0 0 12px"><span>ℹ</span><div><b>' + esc(absenceTxt(S.sheet)) + '</b> — toute la semaine, validé à 0 h.' +
       (valideur ? ' Pour saisir des heures, annulez d\'abord l\'absence.' : "") + '</div></div>' : "") +
     '<div class="tbl-wrap"><table class="ts"><thead><tr>' +
@@ -1177,7 +1183,7 @@ function viewSheet(userId, asStaff) {
       DAYS.map((d, i) => '<div><div class="lbl">' + d.slice(0, 3) + '</div><div class="big" style="font-size:15px">' + (fmt(dayTot(S.lignes, i)) || "0") + ' h</div></div>').join("") + '</div>' +
     (valideur ? '<div class="row" style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">' +
       ((st === "valide" || st === "verrouille")
-        ? '<span class="chip green"><span class="dot"></span>' + (absent ? esc(absenceTxt(S.sheet)) : "Pointage validé — " + fmt(total(S.lignes)) + " h") + '</span>' + (st !== "verrouille" || isFinal() ? '<button class="btn sm" onclick="annulerValidation()">' + (absent ? "Annuler l'absence" : "Annuler la validation") + '</button>' : "")
+        ? '<span class="chip green"><span class="dot"></span>' + (absent ? esc(absenceTxt(S.sheet)) : "Pointage validé — " + fmt(total(S.lignes)) + " h") + '</span>' + (st === "valide" ? '<button class="btn sm" onclick="annulerValidation()">' + (absent ? "Annuler l'absence" : "Annuler la validation") + '</button>' : "")
         : '<button class="btn green" onclick="validerPointage()" ' + (allErrs.length || nbIncomplets || !S.lignes.length ? "disabled" : "") + '>✓ ' + (st === "brouillon" ? "Valider sans transmission" : "Valider le pointage") + '</button><span class="muted">' + (st === "manquant" ? "Pointage non renseigné." : allErrs.length ? "Corriger les incohérences avant de valider." : nbIncomplets ? "Compléter les lignes surlignées avant de valider." : st === "brouillon" ? "Non transmis par le collaborateur — total : " + fmt(total(S.lignes)) + " h" : "Total : " + fmt(total(S.lignes)) + " h") + '</span>') +
       '</div>' : "") +
     '</div>';
@@ -1262,8 +1268,10 @@ window.askAbsent = (userId) => {
   const r = (S.dash || []).find((x) => x.u.id === userId); if (!r) return;
   S.modal = modal("Déclarer absent",
     '<p class="muted" style="margin-top:0">' + esc(fullName(r.u)) + ' · ' + esc(semLabel(S.semaine)) + '</p>' +
-    '<div class="field"><label>Motif de l\'absence (toute la semaine)</label>' +
-      ABSENCES.map(([k, l], i) => '<label style="display:flex;gap:10px;align-items:center;min-height:40px"><input type="radio" name="ab-m" value="' + k + '"' + (i === 0 ? " checked" : "") + '> ' + l + '</label>').join("") + '</div>' +
+    // Hors de .field : son style (largeur 100 %, bordure) étirerait les boutons radio.
+    '<fieldset style="border:0;margin:0 0 13px;padding:0"><legend style="padding:0;font-size:12.5px;font-weight:600;margin-bottom:5px;color:var(--muted)">Motif de l\'absence (toute la semaine)</legend>' +
+      ABSENCES.map(([k, l], i) => '<label style="display:flex;gap:10px;align-items:center;min-height:40px;color:var(--ink);cursor:pointer">' +
+        '<input type="radio" name="ab-m" value="' + k + '"' + (i === 0 ? " checked" : "") + ' style="width:18px;height:18px;margin:0;flex:none;accent-color:var(--accent)">' + l + '</label>').join("") + '</fieldset>' +
     '<div class="field"><label>Précisez (obligatoire pour « Autre »)</label><input class="inp" id="ab-d" placeholder="ex. récupération, mission sur un autre site…"></div>' +
     '<div class="alert ok"><span>ℹ</span><div>La feuille sera <b>validée à 0 h</b> avec ce motif. Vous pourrez annuler l\'absence tant que la semaine n\'est pas verrouillée.</div></div>',
     '<button class="btn" onclick="closeModal()">Annuler</button><button class="btn primary" onclick="declarerAbsent(\'' + userId + '\')">Déclarer absent</button>');
@@ -1316,7 +1324,13 @@ function viewDashboard() {
   d.forEach((r) => { if (r.statut === "valide" || r.statut === "verrouille") c.ok++; else if (r.statut === "manquant") c.miss++; else c.ctrl++; });
   const validated = d.filter((r) => r.statut === "valide" || r.statut === "verrouille").length;
   const totHeures = d.reduce((a, r) => a + (r.total || 0), 0);
-  const semVerrou = d.length > 0 && d.some((r) => r.statut === "verrouille") && d.every((r) => r.statut === "verrouille" || r.statut === "manquant");
+  // Même règle que la base (semaine_bloquants, SQL/11) : bloque toute personne
+  // attendue sans feuille validée, et toute feuille avec des heures non validée.
+  // Une feuille vide d'une personne non attendue (hors période) ne compte pas.
+  const bloquants = d.filter((r) => r.statut !== "valide" && r.statut !== "verrouille" && !(r.horsPeriode && r.statut === "manquant"));
+  const compte = d.filter((r) => !(r.horsPeriode && r.statut === "manquant"));
+  const semVerrou = compte.length > 0 && compte.every((r) => r.statut === "verrouille");
+  const unVerrou = d.some((r) => r.statut === "verrouille");
   const rows = d.map((r) => {
     const m = STATE_META[r.statut];
     const rolePill = r.u.grade && r.u.grade !== "operateur"
@@ -1340,11 +1354,12 @@ function viewDashboard() {
   const mine = equipeSeule ? STATE_META[S.dashMine || "manquant"] : null;
   return '<div class="between"><div><h1>' + (equipeSeule ? "Mon équipe" : "Tableau de bord") + '</h1><div class="muted">' + esc(semLabel(S.semaine)) + '</div></div>' +
     '<div class="row">' + weekPicker() + (isStaff() ? '<button class="btn" onclick="goto(\'export\')">↓ Export</button>' : "") +
-    // Valider / déverrouiller la semaine : valideurs finaux seulement (2e niveau).
-    (semVerrou
-      ? '<span class="chip green"><span class="dot"></span>Semaine verrouillée</span>' + (isFinal() ? '<button class="btn" onclick="askDeverrouiller()">Déverrouiller la semaine</button>' : "")
-      : (isFinal() ? '<button class="btn primary" onclick="askValiderSemaine(' + validated + ',' + d.length + ')">✓ Valider la semaine</button>' : "")) +
+    (semVerrou ? '<span class="chip green"><span class="dot"></span>Semaine verrouillée</span>'
+      : unVerrou ? '<span class="chip orange"><span class="dot"></span>Partiellement verrouillée</span>' : "") +
+    // Déverrouiller : valideurs finaux seulement, dès qu'une feuille est verrouillée.
+    (isFinal() && unVerrou ? '<button class="btn" onclick="askDeverrouiller()">Déverrouiller la semaine</button>' : "") +
     '</div></div>' +
+    (isFinal() && !semVerrou ? carteValiderSemaine(bloquants, compte.length) : "") +
     (equipeSeule ? '<div class="alert ok" style="margin-top:14px"><span>ℹ</span><div><b>Mon pointage :</b> <span class="chip ' + mine.chip + '"><span class="dot"></span>' + mine.txt + '</span> — votre feuille est validée par votre responsable. <a onclick="goto(\'mon-pointage\')">Ouvrir mon pointage</a></div></div>' : "") +
     (isAdmin() && S.backup.due ? '<div class="alert bad" style="margin-top:14px"><span>⚠</span><div><b>Sauvegarde à faire</b> — la semaine ' + esc(S.backup.semaine) + ' est validée mais n\'a pas encore été sauvegardée. <a onclick="ouvrirSauvegarde()">Faire la sauvegarde</a></div></div>' : "") +
     (isStaff() && anneeSuivanteAGenerer() ? '<div class="alert warn" style="margin-top:14px"><span>📅</span><div><b>Fin d\'année</b> — pensez à générer les semaines de <b>' + anneeSuivanteAGenerer() + '</b>. ' + (isAdmin() ? '<a onclick="ouvrirSemaines()">Générer maintenant</a>' : 'À faire par l\'administrateur (Référentiel → Semaines).') + '</div></div>' : "") +
@@ -1385,11 +1400,27 @@ function trendChart(data) {
     '<polyline points="' + line + '" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>' +
     dots + xlab + '</svg></div>';
 }
-window.askValiderSemaine = (v, n) => {
+// Carte « Valider la semaine (2e niveau) » : bouton inactif tant qu'une feuille
+// bloque, avec la liste nominative et un raccourci vers chaque feuille.
+function carteValiderSemaine(bloquants, n) {
+  const resp = (u) => { const x = u.responsable_id && (S.dashUsers || []).find((y) => y.id === u.responsable_id); return x ? " · resp. " + esc(fullName(x)) : ""; };
+  return '<div class="card" style="margin-top:14px"><div class="between"><h3 style="margin:0">Valider la semaine (2e niveau)</h3>' +
+      '<span class="muted">' + (n - bloquants.length) + ' / ' + n + ' validées</span></div>' +
+    (bloquants.length
+      ? '<div class="alert warn"><span>⚠</span><div><b>' + bloquants.length + ' feuille(s) bloquent la semaine.</b> Toutes les feuilles doivent être validées avant de verrouiller — absents compris (« Déclarer absent »).</div></div>' +
+        '<div class="grid-wrap" style="margin-top:10px"><table class="grid"><tbody>' +
+        bloquants.map((r) => '<tr><td><b>' + esc(fullName(r.u)) + '</b><div class="muted" style="font-size:12px">' + (r.statut === "manquant" ? "Aucune heure saisie" : fmt(r.total) + " h") + resp(r.u) + '</div></td>' +
+          '<td><span class="chip ' + STATE_META[r.statut].chip + '"><span class="dot"></span>' + STATE_META[r.statut].txt + '</span></td>' +
+          '<td style="text-align:right;white-space:nowrap">' + (r.statut === "manquant" ? '<button class="btn sm" onclick="askAbsent(\'' + r.u.id + '\')">Déclarer absent</button> ' : "") +
+            '<button class="btn sm primary" onclick="openCollab(\'' + r.u.id + '\')">' + (r.statut === "manquant" ? "Ouvrir" : "Contrôler") + '</button></td></tr>').join("") +
+        '</tbody></table></div>'
+      : '<div class="alert ok"><span>✓</span> Toutes les feuilles sont validées : la semaine peut être verrouillée.</div>') +
+    '<div class="row" style="margin-top:12px"><button class="btn primary" ' + (bloquants.length ? "disabled" : "") + ' onclick="askValiderSemaine(' + n + ')">✓ Valider et verrouiller la semaine</button></div></div>';
+}
+window.askValiderSemaine = (n) => {
   S.modal = modal("Valider la semaine " + S.semaine.numero + " ?",
-    '<p>' + v + ' / ' + n + ' collaborateurs validés.</p>' +
-    (v < n ? '<div class="alert warn"><span>⚠</span> Les pointages non validés seront verrouillés en l\'état.</div>' : "") +
-    '<p class="muted">Après validation, les pointages seront verrouillés et ne pourront plus être modifiés par les collaborateurs.</p>',
+    '<p>Les ' + n + ' feuilles validées vont être <b>verrouillées</b>, à votre nom, comme valideur de 2e niveau.</p>' +
+    '<p class="muted">Plus personne ne pourra les modifier. Pour corriger ensuite, il faudra déverrouiller la semaine avec un motif.</p>',
     '<button class="btn" onclick="closeModal()">Annuler</button><button class="btn green" onclick="validerSemaine()">✓ Valider la semaine</button>');
   render();
 };
