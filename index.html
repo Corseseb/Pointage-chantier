@@ -264,7 +264,9 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 // et à reporter dans ../VERSIONS.md avec la description de la correction.
 // Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
 // quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
-const APP_VERSION = "2.0";
+const APP_VERSION = "2.1";
+// Date de préparation, posée automatiquement par assemble.py : ne pas la modifier à la main.
+const APP_BUILD = "24/10/2026 à 18h05";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
@@ -314,10 +316,20 @@ const dayTot = (ls, i) => ls.reduce((a, l) => { const v = l[DCOL[i]]; return a +
 const total = (ls) => ls.reduce((a, l) => a + rowSub(l), 0);
 const fullName = (u) => u.prenom + " " + u.nom;
 const initials = (u) => (u.prenom[0] + u.nom[0]).toUpperCase();
-// v2.0 : mêmes droits qu'en v1.5 (ancien responsable = valideur final, ancien
-// admin = case cochée). La phase 2 donnera leurs droits aux valideurs d'équipe.
+// Droits (mêmes règles qu'en base, SQL/09) :
+//  - isStaff : lecture de tout (valideur final ou administrateur) → menus complets ;
+//  - isFinal : Responsable / Directeur travaux → valide tout le monde, lui compris,
+//    et agit sur une semaine verrouillée ;
+//  - isChefEquipe : Chef de chantier / Conducteur → son équipe seulement.
+// La case Administrateur ne donne pas le droit de valider.
+const GRADES_EQUIPE = ["chef_chantier", "conducteur_travaux"];
 const isStaff = () => !!S.profile && (S.profile.est_admin || GRADES_FINAUX.includes(S.profile.grade));
 const isAdmin = () => !!S.profile && S.profile.est_admin;
+const isFinal = () => !!S.profile && GRADES_FINAUX.includes(S.profile.grade);
+const isChefEquipe = () => !!S.profile && GRADES_EQUIPE.includes(S.profile.grade);
+const aTableauDeBord = () => isStaff() || isChefEquipe();
+const peutValider = (u) => !!u && (isFinal() ||
+  (isChefEquipe() && u.id !== S.profile.id && u.responsable_id === S.profile.id));
 // Compte à affecter : ni responsable, ni valideur final (qui n'en a pas besoin).
 const sansResponsable = (u) => u.actif && !u.responsable_id && !GRADES_FINAUX.includes(u.grade);
 const semLabel = (s) => s ? `Semaine ${s.numero} — du ${frDate(s.date_debut)} au ${frDate(s.date_fin)}` : "";
@@ -422,9 +434,10 @@ async function boot() {
     await loadRef();
     await loadSemaines();
     await loadMesSemainesPointees();
-    S.view = isStaff() ? "dashboard" : "sheet";
-    if (isStaff()) { await loadDashboard(); await loadBackupState(); }
+    S.view = aTableauDeBord() ? "dashboard" : "sheet";
+    if (aTableauDeBord()) await loadDashboard();
     else await loadSheetFor(S.profile.id);
+    if (isStaff()) await loadBackupState();
   } catch (e) { alert("Chargement impossible : " + errMsg(e)); }
   S.busy = false; _booting = false; render();
 }
@@ -469,7 +482,7 @@ async function loadSemaines() {
 async function loadSheetFor(userId) {
   S.focusUser = userId;
   if (userId === S.profile.id) S.focusUserObj = S.profile;
-  else { const { data: uRow } = await sb.from("app_users").select("id,prenom,nom,email,grade").eq("id", userId).maybeSingle(); S.focusUserObj = uRow || null; }
+  else { const { data: uRow } = await sb.from("app_users").select("id,prenom,nom,email,grade,responsable_id").eq("id", userId).maybeSingle(); S.focusUserObj = uRow || null; }
   const { data, error } = await sb.from("feuilles")
     .select("*, lignes(*)").eq("app_user_id", userId).eq("semaine_id", S.semaine.id).maybeSingle();
   if (error) { alert(errMsg(error)); return; }
@@ -523,7 +536,7 @@ async function saveSheet(silent) {
       if (l.id) { const { error } = await sb.from("lignes").update(payload).eq("id", l.id); if (error) throw error; }
       else { const { data, error } = await sb.from("lignes").insert(payload).select().single(); if (error) throw error; S.lignes[i] = data; }
     }
-    if (isStaff() && S.focusUser && S.focusUser !== S.profile.id) {
+    if (S.focusUser && S.focusUser !== S.profile.id) {
       await sb.from("journal").insert({ feuille_id: S.sheet.id, action: "correction", auteur_id: S.profile.id }).then(() => {}, () => {});
     }
     // DROIT-01 : on ne supprime plus la feuille quand elle est vidée — le statut,
@@ -534,14 +547,17 @@ async function saveSheet(silent) {
   } catch (e) { alert("Enregistrement impossible : " + errMsg(e)); }
   S.busy = false; render();
 }
-async function setStatut(statut, extra) {
+async function setStatut(statut, extra, action) {
   S.busy = true; render();
   try {
     await ensureSheet();
     const patch = Object.assign({ statut }, extra || {});
-    const { error } = await sb.from("feuilles").update(patch).eq("id", S.sheet.id);
+    // .select() : une mise à jour refusée par la base renvoie 0 ligne sans erreur ;
+    // sans ce contrôle, l'écran annoncerait une validation qui n'a pas eu lieu.
+    const { data: maj, error } = await sb.from("feuilles").update(patch).eq("id", S.sheet.id).select("id");
     if (error) throw error;
-    await sb.from("journal").insert({ feuille_id: S.sheet.id, action: statut, auteur_id: S.profile.id }).then(() => {}, () => {});
+    if (!maj || !maj.length) throw new Error("Action refusée : vous n'avez pas le droit de modifier cette feuille.");
+    await sb.from("journal").insert({ feuille_id: S.sheet.id, action: action || statut, auteur_id: S.profile.id }).then(() => {}, () => {});
     await loadSheetFor(S.focusUser);
   } catch (e) { alert(errMsg(e)); }
   S.busy = false; render();
@@ -562,6 +578,7 @@ async function loadDashboard() {
     sb.from("feuilles").select("id, app_user_id, statut, lignes(h_lundi,h_mardi,h_mercredi,h_jeudi,h_vendredi)").eq("semaine_id", S.semaine.id),
   ]);
   const byUser = {}; (feuilles || []).forEach((f) => byUser[f.app_user_id] = f);
+  S.dashUsers = users || [];
   // Tout compte du référentiel doit faire son pointage — collaborateur,
   // responsable travaux comme administrateur — mais seulement sur les semaines
   // où il est effectivement présent (date_arrivee / date_sortie, cf. SQL/07).
@@ -569,7 +586,11 @@ async function loadDashboard() {
   // Règle de sécurité : une feuille existante est TOUJOURS affichée, même hors
   // période de présence. Une date d'arrivée ou de sortie mal saisie ne peut donc
   // jamais faire disparaître silencieusement des heures de l'écran ni du total.
-  S.dash = (users || []).map((u) => {
+  // Un chef de chantier ou un conducteur ne reçoit de la base que lui-même et son
+  // équipe (SQL/09). Sa propre feuille sort de la liste : il ne peut pas la valider,
+  // elle est rappelée à part en tête de l'écran.
+  const equipeSeule = !isStaff();
+  S.dash = (users || []).filter((u) => !equipeSeule || u.id !== S.profile.id).map((u) => {
     const f = byUser[u.id];
     const attendu = u.actif && presentSemaine(u, S.semaine);
     if (!attendu && !f) return null;
@@ -580,6 +601,13 @@ async function loadDashboard() {
   // PERF-01 : l'agrégation est faite en base (rpc stats_semaines) — avant, cet écran
   // rapatriait TOUTES les feuilles puis TOUTES leurs lignes, et devenait faux au-delà
   // du plafond PostgREST de 1000 lignes.
+  if (equipeSeule) {
+    // Statut de sa propre feuille, pour le rappel en tête du tableau de bord.
+    const mine = byUser[S.profile.id];
+    S.dashMine = (!mine || !mine.lignes || !mine.lignes.length) ? "manquant" : mine.statut;
+    S.dashTrend = [];   // la courbe chantier (stats_semaines) est réservée à la lecture globale
+    return;
+  }
   const { data: stats } = await sb.rpc("stats_semaines");
   const byS = {};
   (stats || []).forEach((r) => byS[r.semaine_id] = Number(r.total) || 0);
@@ -739,6 +767,7 @@ async function exportXLSX() {
 const ACTION_LABEL = {
   brouillon: "Pointage rouvert (brouillon)", a_controler: "Transmis pour contrôle",
   valide: "Pointage validé", verrouille: "Pointage verrouillé",
+  valide_sans_transmission: "Pointage validé sans transmission", annulation_validation: "Validation annulée",
   validation_semaine: "Semaine validée et verrouillée", deverrouillage_semaine: "Semaine déverrouillée",
   correction: "Pointage corrigé",
 };
@@ -879,7 +908,7 @@ function render() {
   if (!S.profile) return void (root.innerHTML = tBtn + viewAuth(), bindAuth());
 
   let body = "";
-  if (!isStaff()) body = viewSheet(S.profile.id, false);
+  if (!aTableauDeBord()) body = viewSheet(S.profile.id, false);
   else if (S.view === "mon-pointage") body = viewSheet(S.profile.id, false);   // FONC-01
   else if (S.view === "sheet" || S.view === "control") body = viewSheet(S.focusUser, true);
   else if (S.view === "export") body = viewExport();
@@ -892,7 +921,7 @@ function render() {
   root.innerHTML =
     '<div class="app"><div class="topbar">' +
       '<div class="brand"><img src="' + LOGO + '" alt="Axima"><span class="sep"></span><span class="name">Pointage Chantier RJH</span></div>' +
-      (isStaff() ? nav() : '<div class="nav"><a class="active">Mon pointage</a></div>') +
+      (aTableauDeBord() ? nav() : '<div class="nav"><a class="active">Mon pointage</a></div>') +
       '<div class="spacer"></div><div class="who">' +
         '<button class="btn ghost sm" onclick="toggleTheme()" title="Changer le thème" style="padding:5px 8px">' + themeIcon() + '</button>' +
         '<span class="rolepill">' + esc(GRADE_LABEL[S.profile.grade] || "") + '</span>' +
@@ -900,7 +929,7 @@ function render() {
         '<span class="txt">' + esc(fullName(S.profile)) + '</span>' +
         '<span class="avatar">' + initials(S.profile) + '</span>' +
         '<button class="btn ghost sm" onclick="doLogout()">Quitter</button>' +
-        '<span class="muted" style="font-size:11px;margin-left:8px" title="Version de l\'application">v' + APP_VERSION + '</span>' +
+        '<span class="muted" style="font-size:11px;margin-left:8px" title="Version de l\'application">v' + APP_VERSION + ' du ' + APP_BUILD + '</span>' +
       '</div></div>' +
       '<div class="main">' + body + '</div></div>' +
     (S.modal || "") + (S.busy ? '<div class="overlay"><div class="muted" style="color:#fff">…</div></div>' : "");
@@ -939,7 +968,9 @@ function viewAffiche() {
 }
 
 function nav() {
-  const items = [["dashboard", "Tableau de bord"], ["mon-pointage", "Mon pointage"], ["export", "Export"], ["historique", "Historique"], ["affiche", "Affiche QR"]];
+  const items = isStaff()
+    ? [["dashboard", "Tableau de bord"], ["mon-pointage", "Mon pointage"], ["export", "Export"], ["historique", "Historique"], ["affiche", "Affiche QR"]]
+    : [["dashboard", "Mon équipe"], ["mon-pointage", "Mon pointage"]];   // chef de chantier, conducteur
   if (isAdmin()) items.push(["ref", "Référentiel"]);
   return '<div class="nav">' + items.map((it) => {
     const on = S.view === it[0] || (it[0] === "dashboard" && (S.view === "sheet" || S.view === "control"));
@@ -956,7 +987,9 @@ window.goto = async (v) => {
   render(); window.scrollTo(0, 0);
 };
 window.setHistTab = async (k) => { S.histTab = k; S.busy = true; render(); await loadHistorique(); S.busy = false; render(); };
-window.openCollab = async (id) => { S.busy = true; S.view = "control"; render(); await loadSheetFor(id); S.busy = false; render(); window.scrollTo(0, 0); };
+window.openCollab = async (id) => {
+  if (id === S.profile.id && !isFinal()) return goto("mon-pointage");   // sa feuille se saisit dans « Mon pointage »
+  S.busy = true; S.view = "control"; render(); await loadSheetFor(id); S.busy = false; render(); window.scrollTo(0, 0); };
 window.doLogout = async () => { await sb.auth.signOut(); S.profile = null; S.sheet = null; render(); };
 
 /* ---------- AUTH ---------- */
@@ -1057,7 +1090,10 @@ function viewSheet(userId, asStaff) {
   const meta = STATE_META[st];
   const transmis = st === "a_controler";
   const collabLocked = !asStaff && (st === "a_controler" || st === "valide" || st === "verrouille");
-  const staffLocked = asStaff && st === "verrouille" && !isAdmin();
+  // Contrôle : on ne corrige que ce qu'on a le droit de valider (un administrateur
+  // qui n'est pas valideur consulte en lecture seule). Verrouillé : valideur final seul.
+  const valideur = asStaff && peutValider(u);
+  const staffLocked = asStaff && (!valideur || (st === "verrouille" && !isFinal()));
   const editable = !collabLocked && !staffLocked;
   const INCOMPLET_MSGS = ["Ligne sans activité renseignée", "Activité sans heures saisies", "Données incomplètes"];
   const allErrs = S.lignes.flatMap(lineErrors).filter((e) => !INCOMPLET_MSGS.includes(e));
@@ -1100,7 +1136,8 @@ function viewSheet(userId, asStaff) {
     '<div class="row" style="margin:10px 0 12px"><span class="chip ' + meta.chip + '"><span class="dot"></span>' + ((!asStaff && transmis) ? "À contrôler par le responsable" : meta.txt) + '</span>' +
       (!asStaff && transmis ? '<span class="muted">Transmis' + (S.sheet && S.sheet.date_transmission ? ' le ' + frDateTime(S.sheet.date_transmission) : "") + ' — en attente de validation par le responsable.</span>' : "") +
       (!asStaff && (st === "valide" || st === "verrouille") ? '<span class="muted">Pointage ' + (st === "verrouille" ? "verrouillé" : "validé") + ' — non modifiable.</span>' : "") +
-      (staffLocked ? '<span class="muted">Semaine verrouillée — seul l\'administrateur peut corriger.</span>' : "") + '</div>' +
+      (staffLocked ? '<span class="muted">' + (!valideur ? "Lecture seule — ce pointage est validé par son responsable."
+        : "Semaine verrouillée — seul un responsable ou directeur travaux peut corriger.") + '</span>' : "") + '</div>' +
     '<div class="tbl-wrap"><table class="ts"><thead><tr>' +
       '<th class="col-sticky">Bâtiment</th><th>Niveau</th><th>Salle</th><th>Travaux</th><th>Imput.</th>' +
       DAYS.map((d) => '<th class="daycol">' + d.slice(0, 3) + '</th>').join("") +
@@ -1121,17 +1158,17 @@ function viewSheet(userId, asStaff) {
       : (S.lignes.length && !nbIncomplets ? '<div class="alert ok"><span>✓</span> Pointage complet, aucune incohérence détectée.</div>' : "")) +
     '<div class="totbar"><div><div class="lbl">Total semaine</div><div class="big">' + (fmt(total(S.lignes)) || "0") + ' h</div></div>' +
       DAYS.map((d, i) => '<div><div class="lbl">' + d.slice(0, 3) + '</div><div class="big" style="font-size:15px">' + (fmt(dayTot(S.lignes, i)) || "0") + ' h</div></div>').join("") + '</div>' +
-    (asStaff ? '<div class="row" style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">' +
+    (valideur ? '<div class="row" style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">' +
       ((st === "valide" || st === "verrouille")
-        ? '<span class="chip green"><span class="dot"></span>Pointage validé — ' + fmt(total(S.lignes)) + ' h</span>' + (st !== "verrouille" || isAdmin() ? '<button class="btn sm" onclick="setStatut(\'a_controler\',{date_validation:null,validee_par:null})">Repasser à contrôler</button>' : "")
-        : '<button class="btn green" onclick="validerPointage()" ' + (allErrs.length || nbIncomplets || !S.lignes.length ? "disabled" : "") + '>✓ Valider le pointage</button><span class="muted">' + (st === "manquant" ? "Pointage non renseigné." : allErrs.length ? "Corriger les incohérences avant de valider." : nbIncomplets ? "Compléter les lignes surlignées avant de valider." : "Total : " + fmt(total(S.lignes)) + " h") + '</span>') +
+        ? '<span class="chip green"><span class="dot"></span>Pointage validé — ' + fmt(total(S.lignes)) + ' h</span>' + (st !== "verrouille" || isFinal() ? '<button class="btn sm" onclick="setStatut(\'a_controler\',{date_validation:null,validee_par:null},\'annulation_validation\')">Annuler la validation</button>' : "")
+        : '<button class="btn green" onclick="validerPointage()" ' + (allErrs.length || nbIncomplets || !S.lignes.length ? "disabled" : "") + '>✓ ' + (st === "brouillon" ? "Valider sans transmission" : "Valider le pointage") + '</button><span class="muted">' + (st === "manquant" ? "Pointage non renseigné." : allErrs.length ? "Corriger les incohérences avant de valider." : nbIncomplets ? "Compléter les lignes surlignées avant de valider." : st === "brouillon" ? "Non transmis par le collaborateur — total : " + fmt(total(S.lignes)) + " h" : "Total : " + fmt(total(S.lignes)) + " h") + '</span>') +
       '</div>' : "") +
     '</div>';
 }
 function weekPicker() {
   if (!S.semaines.length) return "";
   let list = S.semaines;
-  if (!isStaff()) {
+  if (!aTableauDeBord()) {
     // Collaborateur : fenêtre réduite = 5 semaines précédentes + semaine en cours + 4 suivantes.
     // S.semaines est trié du plus récent au plus ancien (les "suivantes" ont un index plus petit).
     const cur = semaineCourante();
@@ -1160,11 +1197,11 @@ window.changeWeek = async (id) => {
   if (!cible) return;
   // Garde-fou : même en forçant la valeur du sélecteur, un collaborateur ne peut
   // pas ouvrir une semaine hors de sa période de présence (sauf s'il y a déjà pointé).
-  if (!isStaff() && !presentSemaine(S.profile, cible) && S.mesSemainesPointees.indexOf(id) < 0) {
+  if (!aTableauDeBord() && !presentSemaine(S.profile, cible) && S.mesSemainesPointees.indexOf(id) < 0) {
     return alert("Cette semaine ne fait pas partie de votre période de présence. Contactez votre responsable si c'est une erreur.");
   }
   S.semaine = cible; S.busy = true; render();
-  if (isStaff() && (S.view === "dashboard")) await loadDashboard();
+  if (aTableauDeBord() && (S.view === "dashboard")) await loadDashboard();
   else await loadSheetFor(S.focusUser || S.profile.id);
   S.busy = false; render();
 };
@@ -1187,7 +1224,13 @@ window.reprendre = async () => {
   await setStatut("brouillon", { date_transmission: null });
   toast("Pointage rouvert — vous pouvez le modifier.");
 };
-window.validerPointage = async () => { await setStatut("valide", { date_validation: new Date().toISOString(), validee_par: S.profile.id }); toast("Pointage validé."); };
+window.validerPointage = async () => {
+  // Feuille restée en brouillon : le collaborateur a oublié de transmettre ; tracé à part.
+  const sansTransmission = S.sheet && S.sheet.statut === "brouillon";
+  await setStatut("valide", { date_validation: new Date().toISOString(), validee_par: S.profile.id },
+    sansTransmission ? "valide_sans_transmission" : "valide");
+  if (S.sheet && S.sheet.statut === "valide") toast("Pointage validé.");
+};
 
 function bindTable() {
   document.querySelectorAll("table.ts input[data-d]").forEach((inp) => {
@@ -1220,19 +1263,27 @@ function viewDashboard() {
     // n'est pas censée être présente cette semaine-là : signalé, jamais masqué.
     const horsP = r.horsPeriode
       ? ' <span class="chip orange" style="font-size:10px;vertical-align:middle" title="Des heures sont saisies alors que cette personne n\'est pas déclarée présente sur cette semaine (voir Référentiel → Collaborateurs).">Hors période</span>' : "";
-    return '<tr><td><b>' + esc(fullName(r.u)) + '</b>' + rolePill + horsP + '<div class="muted" style="font-size:12px">' + esc(r.u.email) + '</div></td>' +
+    // Pour la lecture globale : le responsable de chacun, pour savoir qui relancer.
+    const resp = isStaff() && r.u.responsable_id && (S.dashUsers || []).find((x) => x.id === r.u.responsable_id);
+    const aValider = peutValider(r.u) && (r.statut === "a_controler" || r.statut === "brouillon");
+    return '<tr><td><b>' + esc(fullName(r.u)) + '</b>' + rolePill + horsP + '<div class="muted" style="font-size:12px">' + esc(r.u.email) +
+        (resp ? ' · resp. ' + esc(fullName(resp)) : "") + '</div></td>' +
       '<td class="num">' + (r.statut === "manquant" ? "—" : fmt(r.total) + " h") + '</td>' +
       '<td><span class="chip ' + m.chip + '"><span class="dot"></span>' + m.txt + '</span></td>' +
-      '<td style="text-align:right"><button class="btn sm" onclick="openCollab(\'' + r.u.id + '\')">Voir</button></td></tr>';
+      '<td style="text-align:right"><button class="btn sm' + (aValider ? " primary" : "") + '" onclick="openCollab(\'' + r.u.id + '\')">' + (aValider ? "Contrôler" : "Voir") + '</button></td></tr>';
   }).join("");
-  return '<div class="between"><div><h1>Tableau de bord</h1><div class="muted">' + esc(semLabel(S.semaine)) + '</div></div>' +
-    '<div class="row">' + weekPicker() + '<button class="btn" onclick="goto(\'export\')">↓ Export</button>' +
+  const equipeSeule = !isStaff();
+  const mine = equipeSeule ? STATE_META[S.dashMine || "manquant"] : null;
+  return '<div class="between"><div><h1>' + (equipeSeule ? "Mon équipe" : "Tableau de bord") + '</h1><div class="muted">' + esc(semLabel(S.semaine)) + '</div></div>' +
+    '<div class="row">' + weekPicker() + (isStaff() ? '<button class="btn" onclick="goto(\'export\')">↓ Export</button>' : "") +
+    // Valider / déverrouiller la semaine : valideurs finaux seulement (2e niveau).
     (semVerrou
-      ? '<span class="chip green"><span class="dot"></span>Semaine verrouillée</span>' + (isAdmin() ? '<button class="btn" onclick="askDeverrouiller()">Déverrouiller la semaine</button>' : "")
-      : '<button class="btn primary" onclick="askValiderSemaine(' + validated + ',' + d.length + ')">✓ Valider la semaine</button>') +
+      ? '<span class="chip green"><span class="dot"></span>Semaine verrouillée</span>' + (isFinal() ? '<button class="btn" onclick="askDeverrouiller()">Déverrouiller la semaine</button>' : "")
+      : (isFinal() ? '<button class="btn primary" onclick="askValiderSemaine(' + validated + ',' + d.length + ')">✓ Valider la semaine</button>' : "")) +
     '</div></div>' +
+    (equipeSeule ? '<div class="alert ok" style="margin-top:14px"><span>ℹ</span><div><b>Mon pointage :</b> <span class="chip ' + mine.chip + '"><span class="dot"></span>' + mine.txt + '</span> — votre feuille est validée par votre responsable. <a onclick="goto(\'mon-pointage\')">Ouvrir mon pointage</a></div></div>' : "") +
     (isAdmin() && S.backup.due ? '<div class="alert bad" style="margin-top:14px"><span>⚠</span><div><b>Sauvegarde à faire</b> — la semaine ' + esc(S.backup.semaine) + ' est validée mais n\'a pas encore été sauvegardée. <a onclick="ouvrirSauvegarde()">Faire la sauvegarde</a></div></div>' : "") +
-    (anneeSuivanteAGenerer() ? '<div class="alert warn" style="margin-top:14px"><span>📅</span><div><b>Fin d\'année</b> — pensez à générer les semaines de <b>' + anneeSuivanteAGenerer() + '</b>. ' + (isAdmin() ? '<a onclick="ouvrirSemaines()">Générer maintenant</a>' : 'À faire par l\'administrateur (Référentiel → Semaines).') + '</div></div>' : "") +
+    (isStaff() && anneeSuivanteAGenerer() ? '<div class="alert warn" style="margin-top:14px"><span>📅</span><div><b>Fin d\'année</b> — pensez à générer les semaines de <b>' + anneeSuivanteAGenerer() + '</b>. ' + (isAdmin() ? '<a onclick="ouvrirSemaines()">Générer maintenant</a>' : 'À faire par l\'administrateur (Référentiel → Semaines).') + '</div></div>' : "") +
     '<div class="kpis" style="margin-top:14px">' +
       '<div class="kpi"><div class="n">' + d.length + '</div><div class="l">Collaborateurs présents</div></div>' +
       '<div class="kpi"><div class="n" style="color:var(--green)">' + c.ok + '</div><div class="l">Complets</div></div>' +
@@ -1242,10 +1293,10 @@ function viewDashboard() {
     '<div class="card" style="margin-top:14px"><div class="between" style="margin-bottom:10px"><h3 style="margin:0">État des pointages</h3>' +
       '<span class="muted">' + validated + ' / ' + d.length + ' validés</span></div>' +
       '<div class="grid-wrap"><table class="grid"><thead><tr><th>Collaborateur</th><th class="num">Heures</th><th>État</th><th></th></tr></thead>' +
-      '<tbody>' + (rows || '<tr><td colspan="4" class="muted">Aucun collaborateur présent sur cette semaine.</td></tr>') + '</tbody></table></div></div>' +
-    '<div class="card" style="margin-top:14px"><h3 style="margin-top:0">Évolution des heures pointées</h3>' +
+      '<tbody>' + (rows || '<tr><td colspan="4" class="muted">' + (equipeSeule ? "Aucun collaborateur de votre équipe n'est présent cette semaine. L'administrateur affecte les équipes dans Référentiel → Collaborateurs." : "Aucun collaborateur présent sur cette semaine.") + '</td></tr>') + '</tbody></table></div></div>' +
+    (equipeSeule ? "" : '<div class="card" style="margin-top:14px"><h3 style="margin-top:0">Évolution des heures pointées</h3>' +
       '<div class="muted" style="font-size:12px;margin-bottom:6px">Total d\'heures par semaine — 12 dernières semaines.</div>' +
-      trendChart(S.dashTrend) + '</div>';
+      trendChart(S.dashTrend) + '</div>');
 }
 function trendChart(data) {
   if (!data || data.length < 2) return '<div class="muted" style="font-size:13px;padding:6px 0">Il faut au moins 2 semaines de données pour afficher la courbe.</div>';
