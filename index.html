@@ -264,9 +264,9 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 // et à reporter dans ../VERSIONS.md avec la description de la correction.
 // Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
 // quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
-const APP_VERSION = "2.4";
+const APP_VERSION = "2.5";
 // Date de préparation, posée automatiquement par assemble.py : ne pas la modifier à la main.
-const APP_BUILD = "24/10/2026 à 18h43";
+const APP_BUILD = "24/10/2026 à 19h32";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
@@ -705,20 +705,33 @@ async function deverrouillerSemaine() {
 const STATUTS_EXPORTES = ["valide", "verrouille"];
 async function fetchDetail() {
   const { data: toutes, error } = await sb.from("feuilles")
-    .select("app_user_id, statut, lignes(*)").eq("semaine_id", S.semaine.id);
+    .select("app_user_id, statut, absence_motif, absence_detail, validee_par, verrouillee_par, lignes(*)").eq("semaine_id", S.semaine.id);
   if (error) { alert("Export impossible : " + errMsg(error)); return []; }
   const feuilles = (toutes || []).filter((f) => STATUTS_EXPORTES.includes(f.statut));
   const ecartees = (toutes || []).filter((f) => !STATUTS_EXPORTES.includes(f.statut));
   S.exportEcarte = { feuilles: ecartees.length, heures: ecartees.reduce((n, f) => n + total(f.lignes || []), 0) };
-  const uids = [...new Set((feuilles || []).map((f) => f.app_user_id))];
+  // Collaborateurs ET valideurs des deux niveaux, pour les colonnes « Validé par ».
+  const uids = [...new Set(feuilles.flatMap((f) => [f.app_user_id, f.validee_par, f.verrouillee_par]).filter(Boolean))];
   let umap = {};
   if (uids.length) {
-    const { data: us } = await sb.from("app_users").select("id, prenom, nom, email").in("id", uids);
+    const { data: us } = await sb.from("app_users").select("id, prenom, nom, email, grade").in("id", uids);
     (us || []).forEach((u) => umap[u.id] = u);
   }
+  const nomDe = (id) => umap[id] ? fullName(umap[id]) : "";
   const rows = [];
-  (feuilles || []).forEach((f) => {
+  feuilles.forEach((f) => {
     const u = umap[f.app_user_id] || { prenom: "?", nom: "?", email: "" };
+    // Colonnes v2.5 (PRD US-20) : grade, valideurs des deux niveaux, motif d'absence.
+    const commun = { Collaborateur: fullName(u), "E-mail": u.email, Grade: GRADE_LABEL[u.grade] || "", Semaine: "S" + S.semaine.numero };
+    const fin = {
+      "Motif d'absence": f.absence_motif ? ABSENCE_LABEL[f.absence_motif] + (f.absence_detail ? " (" + f.absence_detail + ")" : "") : "",
+      "Validé par (1er niveau)": nomDe(f.validee_par), "Validé par (2e niveau)": nomDe(f.verrouillee_par),
+    };
+    // Un absent n'a aucune ligne : il figure quand même, à 0 h, avec son motif.
+    if (f.absence_motif) {
+      rows.push(Object.assign({}, commun, { Date: "", Jour: "", "Bâtiment": "", Niveau: "", Salle: "", Travaux: "", Imputation: "", Heures: 0, Observation: "" }, fin));
+      return;
+    }
     (f.lignes || []).forEach((l) => {
       const b = (S.ref.batiments.find((x) => x.id === l.batiment_id) || {}).code || "";
       const nv = (S.ref.niveaux.find((x) => x.id === l.niveau_id) || {}).code || "";
@@ -726,11 +739,10 @@ async function fetchDetail() {
       const tv = (S.ref.typologies.find((x) => x.id === l.typologie_id) || {}).libelle || "";
       DCOL.forEach((k, i) => {
         const h = typeof l[k] === "number" ? l[k] : num(l[k]);
-        if (h) rows.push({
-          Collaborateur: fullName(u), "E-mail": u.email, Semaine: "S" + S.semaine.numero,
+        if (h) rows.push(Object.assign({}, commun, {
           Date: dateOfDay(i), Jour: DAYS[i], "Bâtiment": b, Niveau: nv, Salle: sl,
           Travaux: tv, Imputation: l.imputation || "", Heures: h, Observation: l.observation || "",
-        });
+        }, fin));
       });
     });
   });
@@ -929,8 +941,8 @@ function render() {
   if (!aTableauDeBord()) body = viewSheet(S.profile.id, false);
   else if (S.view === "mon-pointage") body = viewSheet(S.profile.id, false);   // FONC-01
   else if (S.view === "sheet" || S.view === "control") body = viewSheet(S.focusUser, true);
-  else if (S.view === "export") body = viewExport();
-  else if (S.view === "email") body = viewEmail();
+  else if (S.view === "export") body = isFinal() ? viewExport() : viewDashboard();
+  else if (S.view === "email") body = isFinal() ? viewEmail() : viewDashboard();
   else if (S.view === "ref") body = isAdmin() ? viewRef() : viewDashboard();
   else if (S.view === "affiche") body = viewAffiche();
   else if (S.view === "historique") body = viewHistorique();
@@ -988,6 +1000,7 @@ function viewAffiche() {
 function nav() {
   const items = isStaff()
     ? [["dashboard", "Tableau de bord"], ["mon-pointage", "Mon pointage"], ["export", "Export"], ["historique", "Historique"], ["affiche", "Affiche QR"]]
+        .filter((it) => it[0] !== "export" || isFinal())   // export : Responsables et Directeurs travaux (PRD US-18)
     : [["dashboard", "Mon équipe"], ["mon-pointage", "Mon pointage"]];   // chef de chantier, conducteur
   if (isAdmin()) items.push(["ref", "Référentiel"]);
   return '<div class="nav">' + items.map((it) => {
@@ -1353,7 +1366,7 @@ function viewDashboard() {
   const equipeSeule = !isStaff();
   const mine = equipeSeule ? STATE_META[S.dashMine || "manquant"] : null;
   return '<div class="between"><div><h1>' + (equipeSeule ? "Mon équipe" : "Tableau de bord") + '</h1><div class="muted">' + esc(semLabel(S.semaine)) + '</div></div>' +
-    '<div class="row">' + weekPicker() + (isStaff() ? '<button class="btn" onclick="goto(\'export\')">↓ Export</button>' : "") +
+    '<div class="row">' + weekPicker() + (isFinal() ? '<button class="btn" onclick="goto(\'export\')">↓ Export</button>' : "") +
     (semVerrou ? '<span class="chip green"><span class="dot"></span>Semaine verrouillée</span>'
       : unVerrou ? '<span class="chip orange"><span class="dot"></span>Partiellement verrouillée</span>' : "") +
     // Déverrouiller : valideurs finaux seulement, dès qu'une feuille est verrouillée.
@@ -1504,13 +1517,15 @@ function buildWorkbook(rows) {
   // sous la forme 16,299999999999997 (constat CALC-01).
   const byC = {};
   rows.forEach((r) => {
-    const c = byC[r.Collaborateur] || (byC[r.Collaborateur] = { "E-mail": r["E-mail"], h: 0 });
+    const c = byC[r.Collaborateur] || (byC[r.Collaborateur] = { "E-mail": r["E-mail"], Grade: r.Grade, motif: r["Motif d'absence"], h: 0 });
     c.h += r.Heures;
   });
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
-    Object.entries(byC).map(([k, v]) => ({ Collaborateur: k, "E-mail": v["E-mail"], "Total heures": round2(v.h) }))
+    Object.entries(byC).map(([k, v]) => ({ Collaborateur: k, "E-mail": v["E-mail"], Grade: v.Grade, "Total heures": round2(v.h), "Motif d'absence": v.motif }))
   ), "Synthèse collaborateurs");
-  const agg = (key) => { const m = {}; rows.forEach((r) => m[r[key]] = (m[r[key]] || 0) + r.Heures); return Object.entries(m).map(([k, v]) => ({ [key]: k, "Total heures": round2(v) })); };
+  // Synthèse chantier : les lignes d'absence (0 h, sans bâtiment) n'y ont pas leur place.
+  const travail = rows.filter((r) => r.Heures);
+  const agg = (key) => { const m = {}; travail.forEach((r) => m[r[key]] = (m[r[key]] || 0) + r.Heures); return Object.entries(m).map(([k, v]) => ({ [key]: k, "Total heures": round2(v) })); };
   const synth = [{ A: "Par bâtiment" }].concat(agg("Bâtiment"), [{}], [{ A: "Par niveau" }], agg("Niveau"), [{}], [{ A: "Par travaux" }], agg("Travaux"), [{}], [{ A: "Par imputation" }], agg("Imputation"));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(synth, { skipHeader: true }), "Synthèse chantier");
   return wb;
