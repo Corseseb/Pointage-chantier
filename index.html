@@ -264,9 +264,9 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 // et à reporter dans ../VERSIONS.md avec la description de la correction.
 // Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
 // quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
-const APP_VERSION = "2.1";
+const APP_VERSION = "2.2";
 // Date de préparation, posée automatiquement par assemble.py : ne pas la modifier à la main.
-const APP_BUILD = "24/10/2026 à 18h05";
+const APP_BUILD = "24/10/2026 à 18h26";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
@@ -280,6 +280,10 @@ const GRADES = [
   ["directeur_travaux", "Directeur Travaux"],
 ];
 const GRADE_LABEL = Object.fromEntries(GRADES);
+// Absence toute la semaine (SQL/10) : feuille validée à 0 h avec un motif.
+const ABSENCES = [["conges", "Congés"], ["maladie", "Maladie"], ["formation", "Formation"], ["autre", "Autre"]];
+const ABSENCE_LABEL = Object.fromEntries(ABSENCES);
+const absenceTxt = (f) => "Absent – " + ABSENCE_LABEL[f.absence_motif] + (f.absence_detail ? " (" + f.absence_detail + ")" : "");
 // Peuvent être choisis comme responsable (valideur de 1er niveau).
 const GRADES_VALIDEURS = ["chef_chantier", "conducteur_travaux", "responsable_travaux", "directeur_travaux"];
 // Valideurs finaux : valident tout le monde, eux compris, et n'ont pas de responsable.
@@ -564,6 +568,14 @@ async function setStatut(statut, extra, action) {
 }
 
 /* ---------- dashboard ---------- */
+// Une feuille sans ligne vaut « Non renseigné »… sauf une absence déclarée, qui est
+// une feuille validée à 0 h (SQL/10) et compte comme telle partout.
+function statutFeuille(f, lignes) {
+  if (!f) return "manquant";
+  if (f.absence_motif) return f.statut;
+  const ls = lignes || f.lignes;
+  return (!ls || !ls.length) ? "manquant" : f.statut;
+}
 async function loadDashboard() {
   // Tous les comptes actifs, pas seulement ceux de rôle « collaborateur ».
   // Depuis que le staff peut saisir son propre pointage, ses heures partaient dans
@@ -575,7 +587,7 @@ async function loadDashboard() {
   // sinon l'historique du tableau de bord changerait rétroactivement.
   const [{ data: users }, { data: feuilles }] = await Promise.all([
     sb.from("app_users").select("*").order("nom"),
-    sb.from("feuilles").select("id, app_user_id, statut, lignes(h_lundi,h_mardi,h_mercredi,h_jeudi,h_vendredi)").eq("semaine_id", S.semaine.id),
+    sb.from("feuilles").select("id, app_user_id, statut, absence_motif, absence_detail, lignes(h_lundi,h_mardi,h_mercredi,h_jeudi,h_vendredi)").eq("semaine_id", S.semaine.id),
   ]);
   const byUser = {}; (feuilles || []).forEach((f) => byUser[f.app_user_id] = f);
   S.dashUsers = users || [];
@@ -594,8 +606,8 @@ async function loadDashboard() {
     const f = byUser[u.id];
     const attendu = u.actif && presentSemaine(u, S.semaine);
     if (!attendu && !f) return null;
-    const st = (!f || !f.lignes || !f.lignes.length) ? "manquant" : f.statut;
-    return { u, statut: st, total: f ? total(f.lignes || []) : 0, horsPeriode: !attendu };
+    return { u, statut: statutFeuille(f), absence: f && f.absence_motif ? f : null,
+      total: f ? total(f.lignes || []) : 0, horsPeriode: !attendu };
   }).filter(Boolean);
   // tendance : les 12 dernières semaines QUI ONT des pointages (ordre chronologique)
   // PERF-01 : l'agrégation est faite en base (rpc stats_semaines) — avant, cet écran
@@ -604,7 +616,7 @@ async function loadDashboard() {
   if (equipeSeule) {
     // Statut de sa propre feuille, pour le rappel en tête du tableau de bord.
     const mine = byUser[S.profile.id];
-    S.dashMine = (!mine || !mine.lignes || !mine.lignes.length) ? "manquant" : mine.statut;
+    S.dashMine = statutFeuille(mine);
     S.dashTrend = [];   // la courbe chantier (stats_semaines) est réservée à la lecture globale
     return;
   }
@@ -768,6 +780,7 @@ const ACTION_LABEL = {
   brouillon: "Pointage rouvert (brouillon)", a_controler: "Transmis pour contrôle",
   valide: "Pointage validé", verrouille: "Pointage verrouillé",
   valide_sans_transmission: "Pointage validé sans transmission", annulation_validation: "Validation annulée",
+  absence: "Déclaré absent", annulation_absence: "Absence annulée",
   validation_semaine: "Semaine validée et verrouillée", deverrouillage_semaine: "Semaine déverrouillée",
   correction: "Pointage corrigé",
 };
@@ -1086,14 +1099,16 @@ function opt(list, val, ph, key) { return '<option value="">' + ph + '</option>'
 function viewSheet(userId, asStaff) {
   const u = asStaff ? (S.focusUserObj || (S.dash && (S.dash.find((d) => d.u.id === userId) || {}).u)) : S.profile;
   const uname = u ? fullName(u).toUpperCase() : "";
-  const st = (!S.sheet || !S.lignes.length) ? "manquant" : S.sheet.statut;
+  const st = statutFeuille(S.sheet, S.lignes);
   const meta = STATE_META[st];
+  const absent = !!(S.sheet && S.sheet.absence_motif);
   const transmis = st === "a_controler";
   const collabLocked = !asStaff && (st === "a_controler" || st === "valide" || st === "verrouille");
   // Contrôle : on ne corrige que ce qu'on a le droit de valider (un administrateur
   // qui n'est pas valideur consulte en lecture seule). Verrouillé : valideur final seul.
   const valideur = asStaff && peutValider(u);
-  const staffLocked = asStaff && (!valideur || (st === "verrouille" && !isFinal()));
+  // Une absence déclarée ne se complète pas : on l'annule d'abord.
+  const staffLocked = asStaff && (!valideur || absent || (st === "verrouille" && !isFinal()));
   const editable = !collabLocked && !staffLocked;
   const INCOMPLET_MSGS = ["Ligne sans activité renseignée", "Activité sans heures saisies", "Données incomplètes"];
   const allErrs = S.lignes.flatMap(lineErrors).filter((e) => !INCOMPLET_MSGS.includes(e));
@@ -1136,8 +1151,10 @@ function viewSheet(userId, asStaff) {
     '<div class="row" style="margin:10px 0 12px"><span class="chip ' + meta.chip + '"><span class="dot"></span>' + ((!asStaff && transmis) ? "À contrôler par le responsable" : meta.txt) + '</span>' +
       (!asStaff && transmis ? '<span class="muted">Transmis' + (S.sheet && S.sheet.date_transmission ? ' le ' + frDateTime(S.sheet.date_transmission) : "") + ' — en attente de validation par le responsable.</span>' : "") +
       (!asStaff && (st === "valide" || st === "verrouille") ? '<span class="muted">Pointage ' + (st === "verrouille" ? "verrouillé" : "validé") + ' — non modifiable.</span>' : "") +
-      (staffLocked ? '<span class="muted">' + (!valideur ? "Lecture seule — ce pointage est validé par son responsable."
+      (staffLocked && !absent ? '<span class="muted">' + (!valideur ? "Lecture seule — ce pointage est validé par son responsable."
         : "Semaine verrouillée — seul un responsable ou directeur travaux peut corriger.") + '</span>' : "") + '</div>' +
+    (absent ? '<div class="alert ok" style="margin:0 0 12px"><span>ℹ</span><div><b>' + esc(absenceTxt(S.sheet)) + '</b> — toute la semaine, validé à 0 h.' +
+      (valideur ? ' Pour saisir des heures, annulez d\'abord l\'absence.' : "") + '</div></div>' : "") +
     '<div class="tbl-wrap"><table class="ts"><thead><tr>' +
       '<th class="col-sticky">Bâtiment</th><th>Niveau</th><th>Salle</th><th>Travaux</th><th>Imput.</th>' +
       DAYS.map((d) => '<th class="daycol">' + d.slice(0, 3) + '</th>').join("") +
@@ -1160,7 +1177,7 @@ function viewSheet(userId, asStaff) {
       DAYS.map((d, i) => '<div><div class="lbl">' + d.slice(0, 3) + '</div><div class="big" style="font-size:15px">' + (fmt(dayTot(S.lignes, i)) || "0") + ' h</div></div>').join("") + '</div>' +
     (valideur ? '<div class="row" style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">' +
       ((st === "valide" || st === "verrouille")
-        ? '<span class="chip green"><span class="dot"></span>Pointage validé — ' + fmt(total(S.lignes)) + ' h</span>' + (st !== "verrouille" || isFinal() ? '<button class="btn sm" onclick="setStatut(\'a_controler\',{date_validation:null,validee_par:null},\'annulation_validation\')">Annuler la validation</button>' : "")
+        ? '<span class="chip green"><span class="dot"></span>' + (absent ? esc(absenceTxt(S.sheet)) : "Pointage validé — " + fmt(total(S.lignes)) + " h") + '</span>' + (st !== "verrouille" || isFinal() ? '<button class="btn sm" onclick="annulerValidation()">' + (absent ? "Annuler l'absence" : "Annuler la validation") + '</button>' : "")
         : '<button class="btn green" onclick="validerPointage()" ' + (allErrs.length || nbIncomplets || !S.lignes.length ? "disabled" : "") + '>✓ ' + (st === "brouillon" ? "Valider sans transmission" : "Valider le pointage") + '</button><span class="muted">' + (st === "manquant" ? "Pointage non renseigné." : allErrs.length ? "Corriger les incohérences avant de valider." : nbIncomplets ? "Compléter les lignes surlignées avant de valider." : st === "brouillon" ? "Non transmis par le collaborateur — total : " + fmt(total(S.lignes)) + " h" : "Total : " + fmt(total(S.lignes)) + " h") + '</span>') +
       '</div>' : "") +
     '</div>';
@@ -1231,6 +1248,51 @@ window.validerPointage = async () => {
     sansTransmission ? "valide_sans_transmission" : "valide");
   if (S.sheet && S.sheet.statut === "valide") toast("Pointage validé.");
 };
+window.annulerValidation = async () => {
+  if (S.sheet && S.sheet.absence_motif) {
+    // Absence annulée : la feuille redevient un brouillon vide, à remplir ou à redéclarer.
+    await setStatut("brouillon", { absence_motif: null, absence_detail: null, date_validation: null, validee_par: null }, "annulation_absence");
+  } else {
+    await setStatut("a_controler", { date_validation: null, validee_par: null }, "annulation_validation");
+  }
+};
+
+/* ---------- déclarer absent (SQL/10) ---------- */
+window.askAbsent = (userId) => {
+  const r = (S.dash || []).find((x) => x.u.id === userId); if (!r) return;
+  S.modal = modal("Déclarer absent",
+    '<p class="muted" style="margin-top:0">' + esc(fullName(r.u)) + ' · ' + esc(semLabel(S.semaine)) + '</p>' +
+    '<div class="field"><label>Motif de l\'absence (toute la semaine)</label>' +
+      ABSENCES.map(([k, l], i) => '<label style="display:flex;gap:10px;align-items:center;min-height:40px"><input type="radio" name="ab-m" value="' + k + '"' + (i === 0 ? " checked" : "") + '> ' + l + '</label>').join("") + '</div>' +
+    '<div class="field"><label>Précisez (obligatoire pour « Autre »)</label><input class="inp" id="ab-d" placeholder="ex. récupération, mission sur un autre site…"></div>' +
+    '<div class="alert ok"><span>ℹ</span><div>La feuille sera <b>validée à 0 h</b> avec ce motif. Vous pourrez annuler l\'absence tant que la semaine n\'est pas verrouillée.</div></div>',
+    '<button class="btn" onclick="closeModal()">Annuler</button><button class="btn primary" onclick="declarerAbsent(\'' + userId + '\')">Déclarer absent</button>');
+  render();
+};
+window.declarerAbsent = async (userId) => {
+  const motif = (document.querySelector('input[name="ab-m"]:checked') || {}).value;
+  const detail = ($("#ab-d").value || "").trim();
+  if (!motif) return alert("Choisissez un motif.");
+  if (motif === "autre" && !detail) return alert("Précisez le motif « Autre ».");
+  S.busy = true; render();
+  try {
+    const { data: f, error: e1 } = await sb.from("feuilles").select("id, lignes(id)").eq("app_user_id", userId).eq("semaine_id", S.semaine.id).maybeSingle();
+    if (e1) throw e1;
+    // Des heures déjà saisies ne sont jamais effacées en silence : on ouvre la feuille à la place.
+    if (f && f.lignes && f.lignes.length) throw new Error("Des heures sont déjà saisies pour cette semaine. Ouvrez la feuille pour les corriger ou les supprimer avant de déclarer l'absence.");
+    const patch = { statut: "valide", absence_motif: motif, absence_detail: detail || null,
+      date_validation: new Date().toISOString(), validee_par: S.profile.id };
+    const res = f
+      ? await sb.from("feuilles").update(patch).eq("id", f.id).select("id")
+      : await sb.from("feuilles").insert(Object.assign({ app_user_id: userId, semaine_id: S.semaine.id }, patch)).select("id");
+    if (res.error) throw res.error;
+    if (!res.data || !res.data.length) throw new Error("Action refusée : vous ne validez pas ce collaborateur.");
+    await sb.from("journal").insert({ feuille_id: res.data[0].id, action: "absence", details: { motif, detail: detail || null }, auteur_id: S.profile.id }).then(() => {}, () => {});
+    S.modal = null; await loadDashboard();
+    toast("Absence déclarée — feuille validée à 0 h.");
+  } catch (e) { alert(errMsg(e)); }
+  S.busy = false; render();
+};
 
 function bindTable() {
   document.querySelectorAll("table.ts input[data-d]").forEach((inp) => {
@@ -1269,8 +1331,10 @@ function viewDashboard() {
     return '<tr><td><b>' + esc(fullName(r.u)) + '</b>' + rolePill + horsP + '<div class="muted" style="font-size:12px">' + esc(r.u.email) +
         (resp ? ' · resp. ' + esc(fullName(resp)) : "") + '</div></td>' +
       '<td class="num">' + (r.statut === "manquant" ? "—" : fmt(r.total) + " h") + '</td>' +
-      '<td><span class="chip ' + m.chip + '"><span class="dot"></span>' + m.txt + '</span></td>' +
-      '<td style="text-align:right"><button class="btn sm' + (aValider ? " primary" : "") + '" onclick="openCollab(\'' + r.u.id + '\')">' + (aValider ? "Contrôler" : "Voir") + '</button></td></tr>';
+      '<td><span class="chip ' + m.chip + '"><span class="dot"></span>' + (r.absence ? esc(absenceTxt(r.absence)) : m.txt) + '</span></td>' +
+      '<td style="text-align:right;white-space:nowrap">' +
+        (r.statut === "manquant" && peutValider(r.u) ? '<button class="btn sm" onclick="askAbsent(\'' + r.u.id + '\')">Déclarer absent</button> ' : "") +
+        '<button class="btn sm' + (aValider ? " primary" : "") + '" onclick="openCollab(\'' + r.u.id + '\')">' + (aValider ? "Contrôler" : "Voir") + '</button></td></tr>';
   }).join("");
   const equipeSeule = !isStaff();
   const mine = equipeSeule ? STATE_META[S.dashMine || "manquant"] : null;
