@@ -264,12 +264,24 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 // et à reporter dans ../VERSIONS.md avec la description de la correction.
 // Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
 // quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
-const APP_VERSION = "1.5";
+const APP_VERSION = "2.0";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
-const ROLE_LABEL = { collaborateur: "Collaborateur", responsable: "Responsable travaux", admin: "Administrateur" };
-const ROLE_SHORT = { collaborateur: "Collaborateur", responsable: "Resp. travaux", admin: "Admin" };
+// Grades du chantier (SQL/08), dans l'ordre hiérarchique. Depuis la v2.0, c'est
+// le grade et la case « Administrateur » qui portent les droits ; l'ancienne
+// colonne `role` est recalculée par la base et n'est plus lue ici.
+const GRADES = [
+  ["operateur", "Opérateur"], ["chef_equipe", "Chef d'équipe"], ["chef_chantier", "Chef de chantier"],
+  ["responsable_zone", "Responsable de zone"], ["chef_atelier", "Chef d'atelier"],
+  ["conducteur_travaux", "Conducteur de travaux"], ["responsable_travaux", "Responsable de travaux"],
+  ["directeur_travaux", "Directeur Travaux"],
+];
+const GRADE_LABEL = Object.fromEntries(GRADES);
+// Peuvent être choisis comme responsable (valideur de 1er niveau).
+const GRADES_VALIDEURS = ["chef_chantier", "conducteur_travaux", "responsable_travaux", "directeur_travaux"];
+// Valideurs finaux : valident tout le monde, eux compris, et n'ont pas de responsable.
+const GRADES_FINAUX = ["responsable_travaux", "directeur_travaux"];
 const STATE_META = {
   brouillon: { chip: "grey", txt: "Brouillon" }, a_controler: { chip: "orange", txt: "À contrôler" },
   valide: { chip: "green", txt: "Validé" }, verrouille: { chip: "green", txt: "Verrouillé" },
@@ -302,8 +314,12 @@ const dayTot = (ls, i) => ls.reduce((a, l) => { const v = l[DCOL[i]]; return a +
 const total = (ls) => ls.reduce((a, l) => a + rowSub(l), 0);
 const fullName = (u) => u.prenom + " " + u.nom;
 const initials = (u) => (u.prenom[0] + u.nom[0]).toUpperCase();
-const isStaff = () => S.profile && (S.profile.role === "responsable" || S.profile.role === "admin");
-const isAdmin = () => S.profile && S.profile.role === "admin";
+// v2.0 : mêmes droits qu'en v1.5 (ancien responsable = valideur final, ancien
+// admin = case cochée). La phase 2 donnera leurs droits aux valideurs d'équipe.
+const isStaff = () => !!S.profile && (S.profile.est_admin || GRADES_FINAUX.includes(S.profile.grade));
+const isAdmin = () => !!S.profile && S.profile.est_admin;
+// Compte à affecter : ni responsable, ni valideur final (qui n'en a pas besoin).
+const sansResponsable = (u) => u.actif && !u.responsable_id && !GRADES_FINAUX.includes(u.grade);
 const semLabel = (s) => s ? `Semaine ${s.numero} — du ${frDate(s.date_debut)} au ${frDate(s.date_fin)}` : "";
 // ---- Présence attendue d'un collaborateur sur une semaine donnée ----
 // date_arrivee / date_sortie sont facultatives (voir SQL/07). Vides = présent
@@ -453,7 +469,7 @@ async function loadSemaines() {
 async function loadSheetFor(userId) {
   S.focusUser = userId;
   if (userId === S.profile.id) S.focusUserObj = S.profile;
-  else { const { data: uRow } = await sb.from("app_users").select("id,prenom,nom,email,role").eq("id", userId).maybeSingle(); S.focusUserObj = uRow || null; }
+  else { const { data: uRow } = await sb.from("app_users").select("id,prenom,nom,email,grade").eq("id", userId).maybeSingle(); S.focusUserObj = uRow || null; }
   const { data, error } = await sb.from("feuilles")
     .select("*, lignes(*)").eq("app_user_id", userId).eq("semaine_id", S.semaine.id).maybeSingle();
   if (error) { alert(errMsg(error)); return; }
@@ -879,7 +895,8 @@ function render() {
       (isStaff() ? nav() : '<div class="nav"><a class="active">Mon pointage</a></div>') +
       '<div class="spacer"></div><div class="who">' +
         '<button class="btn ghost sm" onclick="toggleTheme()" title="Changer le thème" style="padding:5px 8px">' + themeIcon() + '</button>' +
-        '<span class="rolepill">' + ROLE_SHORT[S.profile.role] + '</span>' +
+        '<span class="rolepill">' + esc(GRADE_LABEL[S.profile.grade] || "") + '</span>' +
+        (S.profile.est_admin ? '<span class="rolepill">Admin</span>' : "") +
         '<span class="txt">' + esc(fullName(S.profile)) + '</span>' +
         '<span class="avatar">' + initials(S.profile) + '</span>' +
         '<button class="btn ghost sm" onclick="doLogout()">Quitter</button>' +
@@ -1197,8 +1214,8 @@ function viewDashboard() {
   const semVerrou = d.length > 0 && d.some((r) => r.statut === "verrouille") && d.every((r) => r.statut === "verrouille" || r.statut === "manquant");
   const rows = d.map((r) => {
     const m = STATE_META[r.statut];
-    const rolePill = r.u.role !== "collaborateur"
-      ? ' <span class="rolepill" style="font-size:10px;vertical-align:middle">' + ROLE_SHORT[r.u.role] + '</span>' : "";
+    const rolePill = r.u.grade && r.u.grade !== "operateur"
+      ? ' <span class="rolepill" style="font-size:10px;vertical-align:middle">' + esc(GRADE_LABEL[r.u.grade]) + '</span>' : "";
     // Ligne conservée parce qu'il y a des heures saisies, alors que la personne
     // n'est pas censée être présente cette semaine-là : signalé, jamais masqué.
     const horsP = r.horsPeriode
@@ -1397,11 +1414,18 @@ function viewRef() {
       '<button class="btn primary" onclick="addSemainesAnnee()">＋ Générer les semaines pour ' + (new Date().getFullYear() + 1) + '</button></div>' +
       '<p class="muted" style="font-size:12px;margin-top:8px">Conseil : ne génère les semaines de l\'année suivante qu\'en fin d\'année (une vignette de rappel apparaîtra sur le tableau de bord ~6 semaines avant), pour éviter que les collaborateurs se trompent d\'année.</p>';
   } else if (S.refTab === "collaborateurs") {
-    inner = '<p class="muted" style="font-size:13px">Ajoute un collaborateur puis <b>valide son e-mail</b> : il pourra alors créer son mot de passe (onglet « Créer mon mot de passe » de la page de connexion).</p>' +
-      '<div class="grid-wrap"><table class="grid"><thead><tr><th>Prénom</th><th>Nom</th><th>E-mail</th><th>Rôle</th><th>Présence</th><th>E-mail</th><th>Compte</th><th></th></tr></thead><tbody>' +
-      RA.users.map((u) => '<tr><td>' + esc(u.prenom) + '</td><td>' + esc(u.nom) + '</td><td class="muted">' + esc(u.email) + '</td>' +
-        '<td><select class="inp" style="min-width:150px" onchange="setUserRole(\'' + u.id + '\',this.value)">' +
-          ["collaborateur", "responsable", "admin"].map((r) => '<option value="' + r + '"' + (u.role === r ? " selected" : "") + '>' + ROLE_LABEL[r] + '</option>').join("") + '</select></td>' +
+    const nbSans = RA.users.filter(sansResponsable).length;
+    const filtreSans = S.refFiltre === "sans";
+    const liste = filtreSans ? RA.users.filter(sansResponsable) : RA.users;
+    inner = '<p class="muted" style="font-size:13px">Ajoute un collaborateur puis <b>valide son e-mail</b> : il pourra alors créer son mot de passe (onglet « Créer mon mot de passe » de la page de connexion). Grade, responsable et case Administrateur se changent avec « Modifier ».</p>' +
+      '<div class="row" style="margin-bottom:10px">' +
+        '<button class="btn sm' + (filtreSans ? "" : " primary") + '" onclick="setRefFiltre(\'tous\')">Tous (' + RA.users.length + ')</button>' +
+        '<button class="btn sm' + (filtreSans ? " primary" : "") + '" onclick="setRefFiltre(\'sans\')">Sans responsable (' + nbSans + ')</button></div>' +
+      (filtreSans && !nbSans ? '<p class="muted">Tous les collaborateurs actifs ont un responsable.</p>' : "") +
+      '<div class="grid-wrap"><table class="grid"><thead><tr><th>Prénom</th><th>Nom</th><th>E-mail</th><th>Grade</th><th>Responsable</th><th>Présence</th><th>E-mail</th><th>Compte</th><th></th></tr></thead><tbody>' +
+      liste.map((u) => '<tr><td>' + esc(u.prenom) + '</td><td>' + esc(u.nom) + '</td><td class="muted">' + esc(u.email) + '</td>' +
+        '<td style="white-space:nowrap">' + esc(GRADE_LABEL[u.grade] || "") + (u.est_admin ? ' <span class="rolepill" style="font-size:10px">Admin</span>' : "") + '</td>' +
+        '<td style="white-space:nowrap">' + responsableCell(u) + '</td>' +
         '<td class="muted" style="font-size:12px;white-space:nowrap">' + esc(presenceLabel(u)) + '</td>' +
         '<td>' + (u.email_valide ? '<span class="chip green"><span class="dot"></span>Validé</span>' : '<span class="chip orange"><span class="dot"></span>En attente</span>') + '</td>' +
         '<td>' + (u.actif ? '<span class="chip green"><span class="dot"></span>Actif</span>' : '<span class="chip grey"><span class="dot"></span>Inactif</span>') + '</td>' +
@@ -1413,7 +1437,8 @@ function viewRef() {
         '<input class="inp" id="nu-p" placeholder="Prénom" style="max-width:130px">' +
         '<input class="inp" id="nu-n" placeholder="Nom" style="max-width:130px">' +
         '<input class="inp" id="nu-e" placeholder="e-mail" style="max-width:200px">' +
-        '<select class="inp" id="nu-r" style="max-width:160px">' + ["collaborateur", "responsable", "admin"].map((r) => '<option value="' + r + '">' + ROLE_LABEL[r] + '</option>').join("") + '</select>' +
+        '<select class="inp" id="nu-g" style="max-width:190px" title="Grade">' + GRADES.map(([k, l]) => '<option value="' + k + '">' + l + '</option>').join("") + '</select>' +
+        '<select class="inp" id="nu-r" style="max-width:260px" title="Responsable">' + responsableOptions(null, null, "— responsable —") + '</select>' +
         '<select class="inp" id="nu-a" style="max-width:230px" title="Semaine d\'arrivée">' + semaineOptions(null, "debut", "— présent depuis toujours —") + '</select>' +
         '<button class="btn" onclick="addUser()">＋ Ajouter</button></div>' +
       '<p class="muted" style="font-size:12px;margin-top:8px">Pour un arrivé en cours d\'année, choisis sa <b>semaine d\'arrivée</b> : il ne sera pas compté « Non renseigné » sur les semaines précédentes. La semaine de sortie se renseigne plus tard via « Modifier ».</p>';
@@ -1521,7 +1546,22 @@ function semaineOptions(dateCourante, borne, vide) {
 }
 window.setRow = async (tbl, id, patch) => { const { error } = await sb.from(tbl).update(patch).eq("id", id); if (error) return alert(errMsg(error)); refReload(); };
 window.setUser = async (id, patch) => { const { error } = await sb.from("app_users").update(patch).eq("id", id); if (error) return alert(errMsg(error)); refReload(); };
-window.setUserRole = (id, role) => window.setUser(id, { role });
+window.setRefFiltre = (f) => { S.refFiltre = f; render(); };
+// Candidats responsables : chefs de chantier, conducteurs, responsables et
+// directeurs travaux actifs, jamais la personne elle-même. Un responsable
+// désactivé reste affiché s'il est déjà choisi, pour qu'on le voie et le remplace.
+function responsableOptions(selfId, current, vide) {
+  const cands = RA.users.filter((x) => x.id !== selfId && GRADES_VALIDEURS.includes(x.grade) && (x.actif || x.id === current));
+  return '<option value="">' + vide + '</option>' +
+    cands.map((x) => '<option value="' + x.id + '"' + (x.id === current ? " selected" : "") + '>' +
+      esc(fullName(x)) + ' — ' + esc(GRADE_LABEL[x.grade]) + (x.actif ? "" : " (inactif)") + '</option>').join("");
+}
+function responsableCell(u) {
+  const r = u.responsable_id && RA.users.find((x) => x.id === u.responsable_id);
+  if (r) return esc(fullName(r)) + (r.actif ? "" : ' <span class="muted">(inactif)</span>');
+  if (GRADES_FINAUX.includes(u.grade)) return '<span class="muted">Valideur final</span>';
+  return '<span class="chip orange"><span class="dot"></span>Sans responsable</span>';
+}
 window.editUser = async (id) => {
   const u = RA.users.find((x) => x.id === id); if (!u) return;
   const { count } = await sb.from("feuilles").select("*", { count: "exact", head: true }).eq("app_user_id", id);
@@ -1531,6 +1571,13 @@ window.editUser = async (id) => {
     '<div class="field"><label>Nom</label><input class="inp" id="eu-n" value="' + esc(u.nom) + '"></div>' +
     '<div class="field"><label>E-mail</label><input class="inp" id="eu-e" value="' + esc(u.email) + '"></div>' +
     (u.auth_id ? '<div class="alert warn" style="font-size:12px"><span>ℹ</span> Cette personne s\'est déjà connectée : changer l\'e-mail ici ne change pas son identifiant de connexion (utile surtout avant la 1ʳᵉ connexion).</div>' : "") +
+    '<div style="border-top:1px solid var(--line);margin-top:14px;padding-top:12px"><b style="font-size:13px">Grade et validation</b>' +
+      '<div class="field" style="margin-top:8px"><label>Grade</label><select class="inp" id="eu-g">' +
+        GRADES.map(([k, l]) => '<option value="' + k + '"' + (u.grade === k ? " selected" : "") + '>' + l + '</option>').join("") + '</select></div>' +
+      '<div class="field"><label>Responsable (valide ses heures)</label><select class="inp" id="eu-r">' + responsableOptions(u.id, u.responsable_id, "— aucun —") + '</select></div>' +
+      '<p class="muted" style="font-size:12px;margin:4px 0 10px">Seuls les chefs de chantier, conducteurs, responsables et directeurs travaux sont proposés. Sans responsable, les heures sont validées par un responsable ou directeur travaux.</p>' +
+      '<label style="display:flex;gap:8px;align-items:center;min-height:40px"><input type="checkbox" id="eu-adm"' + (u.est_admin ? " checked" : "") + '> Administrateur <span class="muted" style="font-size:12px">(référentiel, comptes, sauvegardes)</span></label>' +
+    '</div>' +
     '<div style="border-top:1px solid var(--line);margin-top:14px;padding-top:12px"><b style="font-size:13px">Présence</b>' +
       '<p class="muted" style="font-size:12px;margin:4px 0 10px">Le tableau de bord ne réclame un pointage que sur les semaines de présence. Laisser vide = présent sur toute la période.</p>' +
       '<div class="field"><label>Semaine d\'arrivée</label><select class="inp" id="eu-a">' + semaineOptions(u.date_arrivee, "debut", "— depuis toujours —") + '</select></div>' +
@@ -1550,8 +1597,19 @@ window.saveUserEdit = async (id) => {
   if (!p || !n || !e) return alert("Prénom, nom et e-mail obligatoires.");
   const a = $("#eu-a").value || null, z = $("#eu-z").value || null;
   if (a && z && z < a) return alert("La semaine de sortie ne peut pas précéder la semaine d'arrivée.");
-  const { error } = await sb.from("app_users").update({ prenom: p, nom: n, email: e, date_arrivee: a, date_sortie: z }).eq("id", id);
+  const u = RA.users.find((x) => x.id === id);
+  const g = $("#eu-g").value, r = $("#eu-r").value || null, adm = $("#eu-adm").checked;
+  const moi = id === S.profile.id;
+  // Garde-fous : l'administrateur ne peut pas s'enfermer dehors lui-même.
+  if (moi && u.est_admin && !adm) return alert("Tu ne peux pas retirer ta propre case Administrateur. Demande-le à un autre administrateur.");
+  if (moi && u.grade !== g && !confirm("Tu changes ton propre grade : tes droits suivront le nouveau grade. Continuer ?")) return;
+  // La base libère l'équipe d'une personne qui ne peut plus valider (SQL/08) : on prévient avant.
+  const equipe = RA.users.filter((x) => x.responsable_id === id).length;
+  if (equipe && GRADES_VALIDEURS.includes(u.grade) && !GRADES_VALIDEURS.includes(g) &&
+      !confirm(equipe + " collaborateur(s) ont " + fullName(u) + " comme responsable. Avec ce grade, il ne peut plus valider : ils passeront « Sans responsable ». Continuer ?")) return;
+  const { error } = await sb.from("app_users").update({ prenom: p, nom: n, email: e, date_arrivee: a, date_sortie: z, grade: g, responsable_id: r, est_admin: adm }).eq("id", id);
   if (error) return alert(/duplicate|unique/i.test(errMsg(error)) ? "Cette adresse e-mail est déjà utilisée par un autre compte." : errMsg(error));
+  if (moi) return location.reload();
   S.modal = null; toast("Collaborateur modifié."); refReload();
 };
 window.deleteUser = async (id) => {
@@ -1565,13 +1623,14 @@ window.deleteUser = async (id) => {
   refReload();
 };
 window.addUser = async () => {
-  const p = $("#nu-p").value.trim(), n = $("#nu-n").value.trim(), e = $("#nu-e").value.trim().toLowerCase(), r = $("#nu-r").value;
+  const p = $("#nu-p").value.trim(), n = $("#nu-n").value.trim(), e = $("#nu-e").value.trim().toLowerCase();
+  const g = $("#nu-g").value, r = $("#nu-r").value || null;
   if (!p || !n || !e) return alert("Prénom, nom et e-mail obligatoires.");
   // SEC-02 : l'adresse n'est PAS validée d'office. L'admin la valide explicitement,
   // juste avant d'envoyer l'invitation — c'est ce qui referme la fenêtre pendant
   // laquelle un tiers pouvait réclamer le compte.
   const a = $("#nu-a").value || null;
-  const { error } = await sb.from("app_users").insert({ prenom: p, nom: n, email: e, role: r, email_valide: false, actif: true, date_arrivee: a });
+  const { error } = await sb.from("app_users").insert({ prenom: p, nom: n, email: e, grade: g, responsable_id: r, email_valide: false, actif: true, date_arrivee: a });
   if (error) return alert(errMsg(error));
   toast("Collaborateur ajouté. Valide son e-mail au moment de l'inviter."); refReload();
 };
