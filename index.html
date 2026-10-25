@@ -264,9 +264,9 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 // et à reporter dans ../VERSIONS.md avec la description de la correction.
 // Il s'affiche en haut à droite de l'écran : c'est le moyen de vérifier d'un coup d'œil
 // quelle version tourne réellement (et que le navigateur n'a pas gardé l'ancienne en cache).
-const APP_VERSION = "2.5";
+const APP_VERSION = "2.6";
 // Date de préparation, posée automatiquement par assemble.py : ne pas la modifier à la main.
-const APP_BUILD = "24/10/2026 à 19h32";
+const APP_BUILD = "24/10/2026 à 20h42";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"];
 const DCOL = ["h_lundi", "h_mardi", "h_mercredi", "h_jeudi", "h_vendredi"];
@@ -1808,7 +1808,7 @@ window.addRef = async (key) => {
 };
 
 /* ---------- Référentiel : E-mails ---------- */
-const EMAIL_TYPE_LABEL = { rappel_collab_j: "Rappel collab. (jeudi)", rappel_collab_v: "Rappel collab. (vendredi)", rappel_resp: "Rappel responsable", export: "Envoi export", test: "Test" };
+const EMAIL_TYPE_LABEL = { rappel_collab_j: "Rappel collab. (jeudi)", rappel_collab_v: "Rappel collab. (vendredi)", rappel_equipe: "Rappel équipe (vendredi 10 h)", rappel_resp: "Point responsables (vendredi 11 h)", export: "Envoi export", test: "Test" };
 function viewRefEmails() {
   const p = S.ref.parametres || {};
   const chk = (k) => p[k] === "true" ? "checked" : "";
@@ -1818,9 +1818,10 @@ function viewRefEmails() {
     '<div class="field"><label><input type="checkbox" id="ep-actif" ' + chk("email_actif") + '> Envoi des e-mails activé (interrupteur général)</label></div>' +
     '<h3 style="margin-top:14px">Rappels automatiques</h3>' +
     '<div class="field"><label><input type="checkbox" id="ep-rc" ' + chk("email_rappel_collab_actif") + '> Rappels aux collaborateurs qui n\'ont pas transmis leur pointage</label>' +
-      '<div class="muted" style="font-size:12px;margin-top:2px">Envoyés le <b>jeudi 16 h 00</b> puis, si toujours pas transmis, le <b>vendredi 11 h 45</b>. Rien n\'est envoyé à ceux qui ont transmis.</div></div>' +
-    '<div class="field"><label><input type="checkbox" id="ep-rr" ' + chk("email_rappel_resp_actif") + '> Rappel aux responsables (pointages à valider / semaine à exporter)</label>' +
-      '<div class="muted" style="font-size:12px;margin-top:2px">Envoyé le <b>vendredi 12 h 00</b>.</div></div>' +
+      '<div class="muted" style="font-size:12px;margin-top:2px">Tous grades. Envoyés le <b>jeudi 16 h 00</b> puis, si toujours pas transmis, le <b>vendredi 9 h 00</b>. Rien n\'est envoyé à ceux qui ont transmis ou sont déclarés absents.</div></div>' +
+    '<div class="field"><label><input type="checkbox" id="ep-rr" ' + chk("email_rappel_resp_actif") + '> Rappels aux valideurs (pointages à valider / semaine à verrouiller et exporter)</label>' +
+      '<div class="muted" style="font-size:12px;margin-top:2px"><b>Vendredi 10 h 00</b> : chaque chef de chantier ou conducteur ayant encore des feuilles à valider reçoit leur liste. ' +
+      '<b>Vendredi 11 h 00</b> : responsables et directeurs travaux reçoivent le point global.</div></div>' +
     '<h3 style="margin-top:14px">Export par e-mail</h3>' +
     '<div class="field"><label>Destinataires par défaut (séparés par « ; »)</label><input class="inp" id="ep-dest" value="' + esc(p.email_export_destinataires || "") + '"></div>' +
     '<div class="field"><label>Adresse de l\'application (dans les liens des e-mails)</label><input class="inp" id="ep-url" value="' + esc(p.app_url || "") + '"></div>' +
